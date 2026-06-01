@@ -1,0 +1,64 @@
+[
+    {
+        "namespace": "networkObserver",
+        "types": [],
+        "functions": [
+            {
+                "name": "setProxyOrigin",
+                "type": "function",
+                "description": "Redirect every extension-initiated http(s) request to `${origin}/proxy/<host>/<path>`. Pass a falsy value to disable.",
+                "async": true,
+                "parameters": [
+                    {
+                        "name": "origin",
+                        "type": "string",
+                        "description": "Local harness server origin, e.g. http://127.0.0.1:PORT"
+                    }
+                ]
+            }
+        ],
+        "events": [
+            {
+                "name": "onRequestActivity",
+                "type": "function",
+                "description": "Fires for every HTTP request lifecycle event observed via XPCOM.",
+                "parameters": [
+                    {
+                        "name": "details",
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "description": "Event type: request, response, cached-response, stop"
+                            },
+                            "url": {
+                                "type": "string"
+                            },
+                            "method": {
+                                "type": "string"
+                            },
+                            "statusCode": {
+                                "type": "integer"
+                            },
+                            "originUrl": {
+                                "type": "string"
+                            },
+                            "channelId": {
+                                "type": "string"
+                            },
+                            "contentPolicyType": {
+                                "type": "integer"
+                            },
+                            "redirectUrl": {
+                                "type": "string"
+                            },
+                            "requestStatus": {
+                                "type": "integer"
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+]

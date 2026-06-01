@@ -1,0 +1,24 @@
+{
+    "manifest_version": 2,
+    "name": "Firefox Playwright Harness Reporter",
+    "version": "1.0.0",
+    "applications": {
+        "gecko": {
+            "id": "firefox-playwright-harness-reporter@local"
+        }
+    },
+    "permissions": ["<all_urls>"],
+    "background": {
+        "scripts": ["background.js"]
+    },
+    "experiment_apis": {
+        "networkObserver": {
+            "schema": "schema.json",
+            "parent": {
+                "scopes": ["addon_parent"],
+                "paths": [["networkObserver"]],
+                "script": "implementation.js"
+            }
+        }
+    }
+}
