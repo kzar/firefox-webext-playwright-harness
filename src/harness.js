@@ -358,14 +358,101 @@ async function installHelperExtension(client, addonsActor, serverPort) {
  * 7. Get the extension's background console actor
  */
 /**
+ * Firefox user prefs the harness requires to install and drive the extension over RDP.
+ * Layered on top of any consumer-supplied `launchOptions.firefoxUserPrefs` so consumer
+ * prefs still apply, but these are never clobbered.
+ */
+const HARNESS_REQUIRED_PREFS = {
+    'xpinstall.signatures.required': false,
+    'extensions.autoDisableScopes': 0,
+    'extensions.enabledScopes': 15,
+    'devtools.debugger.remote-enabled': true,
+    'devtools.debugger.prompt-connection': false,
+    // Playwright's bundled Firefox sets dom.ipc.processCount to 60000 in playwright.cfg
+    // (line 44), forcing every tab into its own content process. This causes severe IPC
+    // latency degradation when multiple tabs are open. Cap at 8 (Firefox's default) so
+    // tabs share processes.
+    'dom.ipc.processCount': 8,
+};
+
+/**
+ * Build the options for `firefox.launchPersistentContext` from the standard Playwright
+ * `use` options the consumer set, layering the harness's invariants on top. The harness
+ * must run Playwright's bundled Firefox (patched in place by `ensureFirefoxPatched`) and
+ * needs the RDP debugger arg plus the extension prefs, so those always win; everything
+ * else (headless, slowMo, viewport, ...) is passed through to behave like a normal
+ * Playwright project.
+ *
+ * @param {number} rdpPort - Port for Firefox's remote debugging server.
+ * @param {object} [playwrightOptions] - Resolved Playwright option-fixture values,
+ *   forwarded from the `context` fixture.
+ * @param {boolean} [playwrightOptions.headless]
+ * @param {object} [playwrightOptions.launchOptions]
+ * @param {object|null} [playwrightOptions.viewport]
+ * @param {string} [playwrightOptions.userAgent]
+ * @param {string} [playwrightOptions.locale]
+ * @param {string} [playwrightOptions.timezoneId]
+ * @param {string} [playwrightOptions.colorScheme]
+ */
+function buildFirefoxLaunchOptions(rdpPort, playwrightOptions = {}) {
+    const {
+        headless,
+        launchOptions = {},
+        viewport,
+        userAgent,
+        locale,
+        timezoneId,
+        colorScheme,
+    } = playwrightOptions;
+
+    // The harness patches Playwright's bundled Firefox in place, so it can't run a
+    // different binary or release channel. Fail fast rather than silently ignoring.
+    for (const unsupported of ['executablePath', 'channel']) {
+        if (launchOptions[unsupported] != null) {
+            throw new Error(
+                `The Firefox harness can't honour launchOptions.${unsupported}: it must run ` +
+                    "Playwright's bundled Firefox, which is patched in place to drive the extension.",
+            );
+        }
+    }
+
+    return {
+        // Context options (top-level Playwright shortcuts). When unset these resolve to
+        // Playwright's own defaults, so passing them through leaves behaviour unchanged.
+        viewport,
+        userAgent,
+        locale,
+        timezoneId,
+        colorScheme,
+        // Pass-through launch options.
+        slowMo: launchOptions.slowMo,
+        devtools: launchOptions.devtools,
+        timeout: launchOptions.timeout,
+        env: launchOptions.env,
+        // The resolved `headless` fixture already folds in `launchOptions.headless`, with
+        // the top-level `use: { headless }` shortcut winning (Playwright's own precedence).
+        headless,
+        // Harness invariants — always win over consumer-supplied values.
+        executablePath: firefox.executablePath(),
+        firefoxUserPrefs: {
+            ...launchOptions.firefoxUserPrefs,
+            ...HARNESS_REQUIRED_PREFS,
+        },
+        args: [...(launchOptions.args || []), `-start-debugger-server=${rdpPort}`],
+    };
+}
+
+/**
  * @param {object} [options]
  * @param {function} [options.routeHandler] - Playwright-style handler for the extension's
  *   redirected background requests.
  * @param {Array<[string, string]>} [options.rewriteStaticRules] - Ordered [from, to] rewrites
  *   applied to a redirected request's reconstructed URL.
+ * @param {object} [options.playwrightOptions] - Resolved standard Playwright `use` options
+ *   (headless, launchOptions, viewport, ...) forwarded from the `context` fixture.
  */
 async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {}) {
-    const { routeHandler, rewriteStaticRules } = options;
+    const { routeHandler, rewriteStaticRules, playwrightOptions } = options;
     // 1. Start local web server
     const server = new FirefoxWebServer();
     await server.start();
@@ -383,24 +470,10 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
     // Patch playwright.cfg to enable experiment_apis
     await ensureFirefoxPatched();
 
-    const context = await firefox.launchPersistentContext(userDataDir, {
-        headless: true,
-        executablePath: firefox.executablePath(),
-        firefoxUserPrefs: {
-            'xpinstall.signatures.required': false,
-            'extensions.autoDisableScopes': 0,
-            'extensions.enabledScopes': 15,
-            'devtools.debugger.remote-enabled': true,
-            'devtools.debugger.prompt-connection': false,
-            // Playwright's bundled Firefox sets dom.ipc.processCount to 60000
-            // in playwright.cfg (line 44), forcing every tab into its own
-            // content process. This causes severe IPC latency degradation
-            // when multiple tabs are open. Cap at 8 (Firefox's default) so
-            // tabs share processes.
-            'dom.ipc.processCount': 8,
-        },
-        args: [`-start-debugger-server=${rdpPort}`],
-    });
+    const context = await firefox.launchPersistentContext(
+        userDataDir,
+        buildFirefoxLaunchOptions(rdpPort, playwrightOptions),
+    );
 
     // 3. Connect via RDP
     const client = await connectToFirefox(rdpPort);

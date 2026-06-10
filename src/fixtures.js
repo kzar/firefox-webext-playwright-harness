@@ -43,12 +43,21 @@ function applyFirefoxHarness(test, { defaultRouteHandler }) {
         ],
 
         // The Firefox extension's BrowserContext.
-        async context({ rdpPort, firefoxHarnessConfig }, use) {
+        //
+        // `headless`, `launchOptions`, `viewport`, `userAgent`, `locale`, `timezoneId` and
+        // `colorScheme` are Playwright's standard option-fixtures: destructuring them here
+        // gives us the values resolved from the consumer's config `use` block, which we
+        // forward so the harness honours them transparently (see buildFirefoxLaunchOptions).
+        async context(
+            { rdpPort, firefoxHarnessConfig, headless, launchOptions, viewport, userAgent, locale, timezoneId, colorScheme },
+            use,
+        ) {
             const { addonId, extensionPath, rewriteStaticRules } = firefoxHarnessConfig;
 
             const { context } = await createFirefoxContext(rdpPort, extensionPath, addonId, {
                 routeHandler: defaultRouteHandler,
                 rewriteStaticRules,
+                playwrightOptions: { headless, launchOptions, viewport, userAgent, locale, timezoneId, colorScheme },
             });
 
             await context.route('**/*', defaultRouteHandler);
