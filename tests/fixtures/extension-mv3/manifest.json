@@ -1,0 +1,26 @@
+{
+    "manifest_version": 3,
+    "name": "Harness Test Extension (MV3)",
+    "version": "1.0.0",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "harness-test-mv3@example.com"
+        }
+    },
+    "permissions": [
+        "webRequest",
+        "webRequestBlocking"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "background": {
+        "scripts": ["background.js"]
+    },
+    "web_accessible_resources": [
+        {
+            "resources": ["page.html"],
+            "matches": ["<all_urls>"]
+        }
+    ]
+}

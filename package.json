@@ -1,10 +1,13 @@
 {
     "name": "firefox-webext-playwright-harness",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Experimental harness for running a Firefox browser extension's Playwright integration tests.",
     "license": "Apache-2.0",
     "repository": "https://github.com/kzar/firefox-webext-playwright-harness",
     "private": true,
+    "workspaces": [
+        "tests"
+    ],
     "engines": {
         "node": ">=20"
     },
@@ -19,7 +22,8 @@
         "LICENSE.md"
     ],
     "scripts": {
-        "lint": "eslint ."
+        "lint": "eslint .",
+        "playwright": "playwright test --config tests/playwright.config.mjs"
     },
     "dependencies": {
         "jszip": "^3.10.1"
@@ -29,7 +33,7 @@
     },
     "devDependencies": {
         "@duckduckgo/eslint-config": "github:duckduckgo/eslint-config#v0.1.0",
-        "@playwright/test": "^1.54.0",
+        "@playwright/test": "*",
         "eslint": "^9.13.0",
         "globals": "^14.0.0"
     }

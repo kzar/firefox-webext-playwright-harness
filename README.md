@@ -76,3 +76,18 @@ if (isFirefox()) {
 
 export { test };
 ```
+
+## Running the tests
+
+```sh
+# Get set up.
+npm install
+npx playwright install firefox
+
+# Run the tests.
+npm run playwright
+
+# Stress-test to catch flakes.
+npm run playwright -- --repeat-each=30 --workers=10
+```
+

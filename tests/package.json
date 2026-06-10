@@ -1,0 +1,19 @@
+{
+    "name": "firefox-webext-playwright-harness-tests",
+    "version": "0.1.0",
+    "description": "Self-contained integration tests for the Firefox web-extension Playwright harness.",
+    "private": true,
+    "type": "module",
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "test": "playwright test"
+    },
+    "dependencies": {
+        "firefox-webext-playwright-harness": "file:.."
+    },
+    "devDependencies": {
+        "@playwright/test": "1.60.0"
+    }
+}
