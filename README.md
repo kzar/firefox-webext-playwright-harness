@@ -77,6 +77,33 @@ if (isFirefox()) {
 export { test };
 ```
 
+## Standalone usage (without @playwright/test)
+
+For cases where you just need to evaluate code in the extension's background context, e.g. unit
+tests using `declarativeNetRequest.testMatchOutcome` or similar, you can use the
+`launchExtensionBackground` function instead, which has less overhead.
+
+```javascript
+const { launchExtensionBackground } = require('firefox-webext-playwright-harness');
+
+const { background, close } = await launchExtensionBackground({
+    extensionPath: '/path/to/built/extension',
+    addonId: 'your-addon@example.com',
+    firefoxUserPrefs: { 'extensions.dnr.feedback': true },
+});
+
+// `background` mimics Playwright's Worker/Page evaluate() contract.
+const result = await background.evaluate(
+    (details) => browser.declarativeNetRequest.testMatchOutcome(details),
+    { url: 'https://tracker.example/script.js', type: 'script' },
+);
+
+await close();
+```
+
+Note: Pages opened in this browser are not routed or bridged, so they aren't usable for testing.
+      If you need to drive pages or intercept requests, use `applyFirefoxHarness` instead.
+
 ## Running the tests
 
 ```sh

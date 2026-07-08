@@ -4,7 +4,7 @@ const os = require('os');
 const path = require('path');
 const JSZip = require('jszip');
 const { firefox } = require('@playwright/test');
-const { connectToFirefox } = require('./web-ext-rdp.js');
+const { connectToFirefox, findFreeTcpPort } = require('./web-ext-rdp.js');
 const { FirefoxWebServer } = require('./web-server.js');
 
 function ensureTempPath(dirOrFilePath) {
@@ -443,6 +443,113 @@ function buildFirefoxLaunchOptions(rdpPort, playwrightOptions = {}) {
 }
 
 /**
+ * Connect to Firefox's Remote Debugging Protocol server and gather the pieces every
+ * extension-driving code path needs: an RDP client with a listener collecting
+ * evaluation results and worker targets, plus the root addons actor used to install
+ * temporary add-ons. The caller owns cleanup (client.disconnect()) once this resolves.
+ */
+async function connectExtensionRdp(rdpPort) {
+    const client = await connectToFirefox(rdpPort);
+    const evalResults = new Map();
+    const workerTargets = [];
+    client.on('unsolicited-event', (msg) => {
+        if (msg.type === 'evaluationResult') {
+            evalResults.set(msg.resultID, msg);
+        }
+        if (msg.type === 'target-available-form' && msg.target && msg.target.url) {
+            workerTargets.push(msg.target);
+        }
+    });
+
+    try {
+        const rootInfo = await client.request('getRoot');
+        const addonsActor = rootInfo.addonsActor;
+        if (!addonsActor) {
+            throw new Error('Firefox does not provide an addons actor');
+        }
+        return { client, evalResults, workerTargets, addonsActor };
+    } catch (err) {
+        client.disconnect();
+        throw err;
+    }
+}
+
+/**
+ * Install the extension under test as a temporary add-on and find the console actor
+ * for its background page, so that code can be evaluated in the background context.
+ * @param {object} rdp - The result of connectExtensionRdp().
+ * @param {string} extensionPath - Absolute path to the built, unpacked extension.
+ * @param {string} addonId - The extension's add-on ID (from its manifest).
+ */
+async function installExtensionAndFindBackground(rdp, extensionPath, addonId) {
+    const { client, workerTargets, addonsActor } = rdp;
+
+    const installResult = await client.request({
+        to: addonsActor,
+        type: 'installTemporaryAddon',
+        addonPath: extensionPath,
+    });
+
+    let ourAddon = null;
+    const maxAddonRetries = 10;
+    for (let attempt = 0; attempt < maxAddonRetries; attempt++) {
+        const addonsResponse = await client.request('listAddons');
+        ourAddon = addonsResponse.addons.find((a) => a.id === addonId);
+        if (ourAddon) break;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    if (!ourAddon) {
+        throw new Error(`Could not find addon ${addonId} after ${maxAddonRetries} attempts`);
+    }
+
+    const watcherResult = await client.request({
+        to: ourAddon.actor,
+        type: 'getWatcher',
+    });
+
+    await client.request({
+        to: watcherResult.actor,
+        type: 'watchTargets',
+        targetType: 'frame',
+    });
+
+    const workerResult = await client.request({
+        to: watcherResult.actor,
+        type: 'watchTargets',
+        targetType: 'worker',
+    });
+
+    let backgroundConsoleActor = null;
+    if (workerResult.target && workerResult.target.url && workerResult.target.url.includes('_generated_background_page')) {
+        backgroundConsoleActor = workerResult.target.consoleActor;
+    }
+
+    if (!backgroundConsoleActor) {
+        const maxTargetRetries = 20;
+        for (let attempt = 0; attempt < maxTargetRetries; attempt++) {
+            const bgTarget = workerTargets.find((t) => t.url && t.url.includes('_generated_background_page'));
+            if (bgTarget && bgTarget.consoleActor) {
+                backgroundConsoleActor = bgTarget.consoleActor;
+                break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+    }
+
+    if (!backgroundConsoleActor) {
+        throw new Error(`Could not find background console actor for ${addonId}`);
+    }
+
+    await client.request({
+        to: backgroundConsoleActor,
+        type: 'startListeners',
+        listeners: ['evaluationResult'],
+    });
+
+    return { addon: installResult.addon, backgroundConsoleActor };
+}
+
+/**
  * @param {object} [options]
  * @param {function} [options.routeHandler] - Playwright-style handler for the extension's
  *   redirected background requests.
@@ -476,96 +583,28 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
     );
 
     // 3. Connect via RDP
-    const client = await connectToFirefox(rdpPort);
-    const evalResults = new Map();
-    const workerTargets = [];
-    const targetListener = (msg) => {
-        if (msg.type === 'evaluationResult') {
-            evalResults.set(msg.resultID, msg);
-        }
-        if (msg.type === 'target-available-form' && msg.target && msg.target.url) {
-            workerTargets.push(msg.target);
-        }
-    };
-    client.on('unsolicited-event', targetListener);
+    let rdp;
+    try {
+        rdp = await connectExtensionRdp(rdpPort);
+    } catch (err) {
+        await server.stop();
+        await withTimeout(context.close(), 10000);
+        await rmTempDir(userDataDir).catch(() => {});
+        _tempDirs.delete(userDataDir);
+        throw err;
+    }
+    const { client, evalResults, addonsActor } = rdp;
 
     let helperTmpDir;
     try {
-        const rootInfo = await client.request('getRoot');
-        const addonsActor = rootInfo.addonsActor;
-        if (!addonsActor) {
-            throw new Error('Firefox does not provide an addons actor');
-        }
-
         // 4. Install helper extension FIRST (so XPCOM observers are active before the extension fetches config)
         helperTmpDir = await installHelperExtension(client, addonsActor, server.port);
 
         // 5. Wait for helper's ready event
         await server.waitForEvent((e) => e.type === 'ready', 10000);
 
-        // 6. Install the extension under test
-        const installResult = await client.request({
-            to: addonsActor,
-            type: 'installTemporaryAddon',
-            addonPath: extensionPath,
-        });
-
-        // 7. Get the extension's background console actor
-        let ourAddon = null;
-        const maxAddonRetries = 10;
-        for (let attempt = 0; attempt < maxAddonRetries; attempt++) {
-            const addonsResponse = await client.request('listAddons');
-            ourAddon = addonsResponse.addons.find((a) => a.id === addonId);
-            if (ourAddon) break;
-            await new Promise((resolve) => setTimeout(resolve, 300));
-        }
-        if (!ourAddon) {
-            throw new Error(`Could not find addon ${addonId} after ${maxAddonRetries} attempts`);
-        }
-
-        const watcherResult = await client.request({
-            to: ourAddon.actor,
-            type: 'getWatcher',
-        });
-
-        await client.request({
-            to: watcherResult.actor,
-            type: 'watchTargets',
-            targetType: 'frame',
-        });
-
-        const workerResult = await client.request({
-            to: watcherResult.actor,
-            type: 'watchTargets',
-            targetType: 'worker',
-        });
-
-        let backgroundConsoleActor = null;
-        if (workerResult.target && workerResult.target.url && workerResult.target.url.includes('_generated_background_page')) {
-            backgroundConsoleActor = workerResult.target.consoleActor;
-        }
-
-        if (!backgroundConsoleActor) {
-            const maxTargetRetries = 20;
-            for (let attempt = 0; attempt < maxTargetRetries; attempt++) {
-                const bgTarget = workerTargets.find((t) => t.url && t.url.includes('_generated_background_page'));
-                if (bgTarget && bgTarget.consoleActor) {
-                    backgroundConsoleActor = bgTarget.consoleActor;
-                    break;
-                }
-                await new Promise((resolve) => setTimeout(resolve, 250));
-            }
-        }
-
-        if (!backgroundConsoleActor) {
-            throw new Error(`Could not find background console actor for ${addonId}`);
-        }
-
-        await client.request({
-            to: backgroundConsoleActor,
-            type: 'startListeners',
-            listeners: ['evaluationResult'],
-        });
+        // 6 + 7. Install the extension under test and find its background console actor
+        const { addon, backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath, addonId);
 
         // Store for cleanup. Cast context to allow stashing private fields.
         const ctx = /** @type {any} */ (context);
@@ -579,7 +618,7 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
         return {
             context,
             rdpResult: {
-                addon: installResult.addon,
+                addon,
                 client,
                 backgroundConsoleActor,
                 evalResults,
@@ -588,8 +627,6 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
     } catch (err) {
         client.disconnect();
         await server.stop();
-        // Close the Playwright context so the Firefox process terminates
-        // rather than running as an orphan until the worker times out.
         await withTimeout(context.close(), 10000);
         if (helperTmpDir) {
             await rmTempDir(helperTmpDir).catch(() => {});
@@ -603,7 +640,9 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
 // Resolve `promise` or null after `ms` so a wedged Firefox / RDP / fs op can't
 // burn the whole 60s teardown budget on one stuck await.
 function withTimeout(promise, ms) {
-    return Promise.race([promise.catch(() => null), new Promise((resolve) => setTimeout(resolve, ms))]);
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(resolve, ms); });
+    return Promise.race([promise.catch(() => null), timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -652,9 +691,84 @@ async function cleanupFirefoxContext(context) {
     }
 }
 
+/**
+ * Launch Playwright's bundled Firefox, install the given extension as a temporary
+ * add-on and return a handle for evaluating code in the extension's background
+ * context — nothing else.
+ *
+ * This is the standalone (non-@playwright/test) entry point, for tooling that only
+ * needs a background `evaluate()` — for example a Puppeteer-style test interface
+ * that loads declarativeNetRequest rules and checks testMatchOutcome results. Unlike
+ * the `applyFirefoxHarness` fixtures, no omni.ja patching (globalSetup), XPCOM
+ * helper extension or network interception is involved; this runs against the stock
+ * bundled Firefox. The trade-off is that pages opened in the browser are not routed
+ * or bridged — if you need to drive pages or intercept requests, use
+ * `applyFirefoxHarness` instead.
+ *
+ * @param {object} options
+ * @param {string} options.extensionPath - Absolute path to the built, unpacked extension.
+ * @param {string} options.addonId - The extension's add-on ID (from its manifest).
+ * @param {boolean} [options.headless] - Defaults to Playwright's default (headless).
+ * @param {object} [options.firefoxUserPrefs] - Extra Firefox preferences, e.g.
+ *   `{ 'extensions.dnr.feedback': true }`. The harness's required preferences are
+ *   layered on top and always win.
+ * @param {string[]} [options.args] - Extra Firefox command line arguments.
+ * @returns {Promise<{ background: FirefoxBackgroundPage, close: () => Promise<void> }>}
+ */
+async function launchExtensionBackground({ extensionPath, addonId, headless, firefoxUserPrefs, args }) {
+    const rdpPort = await findFreeTcpPort();
+
+    const userDataDir = await fs.mkdtemp(`${os.tmpdir()}/firefox-ext-background-`);
+    _tempDirs.add(userDataDir);
+
+    const context = await firefox.launchPersistentContext(
+        userDataDir,
+        buildFirefoxLaunchOptions(rdpPort, { headless, launchOptions: { firefoxUserPrefs, args } }),
+    );
+
+    let client = null;
+    try {
+        const rdp = await connectExtensionRdp(rdpPort);
+        client = rdp.client;
+
+        const { backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath, addonId);
+        const background = new FirefoxBackgroundPage(client, backgroundConsoleActor, rdp.evalResults);
+
+        let closed = false;
+        const close = async () => {
+            if (closed) return;
+            closed = true;
+            try {
+                client.disconnect();
+            } catch {
+                // Ignore disconnect errors
+            }
+            rdp.evalResults.clear();
+            await withTimeout(context.close(), 10000);
+            await rmTempDir(userDataDir).catch(() => {});
+            _tempDirs.delete(userDataDir);
+        };
+
+        return { background, close };
+    } catch (err) {
+        if (client) {
+            try {
+                client.disconnect();
+            } catch {
+                // Ignore disconnect errors
+            }
+        }
+        await withTimeout(context.close(), 10000);
+        await rmTempDir(userDataDir).catch(() => {});
+        _tempDirs.delete(userDataDir);
+        throw err;
+    }
+}
+
 module.exports = {
     ensureFirefoxPatched,
     FirefoxBackgroundPage,
     createFirefoxContext,
     cleanupFirefoxContext,
+    launchExtensionBackground,
 };
