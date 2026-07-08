@@ -49,6 +49,25 @@ test.describe('Background script eval', () => {
         expect(name).toMatch(/^Harness Test Extension/);
     });
 
+    test('returns a result larger than the RDP inline limit', async ({ backgroundPage }) => {
+        // Results over ~10KB come back as a longString grip that has to be reassembled
+        // from its actor; before that was handled a large result was misread and the
+        // evaluate hung until timeout.
+        const size = 50000;
+        const big = await backgroundPage.evaluate((n) => 'y'.repeat(n), size);
+        expect(big).toHaveLength(size);
+        expect(big).toBe('y'.repeat(size));
+    });
+
+    test('returns a large result from a resolved promise', async ({ backgroundPage }) => {
+        // The promise path stashes the serialised value on a globalThis slot and reads
+        // it back, so a large value exercises the longString handling on that read too.
+        const size = 50000;
+        const big = await backgroundPage.evaluate((n) => Promise.resolve('z'.repeat(n)), size);
+        expect(big).toHaveLength(size);
+        expect(big).toBe('z'.repeat(size));
+    });
+
     test('resolves a promise result', async ({ backgroundPage }) => {
         const value = await backgroundPage.evaluate(() => Promise.resolve(21 * 2));
         expect(value).toBe(42);

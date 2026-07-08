@@ -104,6 +104,51 @@ async function ensureFirefoxPatched() {
 }
 
 /**
+ * Resolve a Firefox RDP "grip" (the value shape carried in evaluationResult.result)
+ * into a plain JS value.
+ *
+ * Primitives arrive as-is; `{ type: 'undefined' }` / `{ type: 'null' }` map to
+ * undefined/null; a `{ type, value }` wrapper is unwrapped; and a longString grip
+ * (`{ type: 'longString', initial, length, actor }`, returned whenever a string
+ * exceeds the RDP inline limit of ~10KB) is fully reassembled by fetching the
+ * remainder from its actor via `substring`. Without the longString handling a large
+ * evaluate() result stays an unrecognised object, so the caller never sees it resolve
+ * and polls until timeout.
+ */
+async function resolveGrip(client, grip) {
+    if (grip === null || typeof grip !== 'object') {
+        return grip;
+    }
+    if (grip.type === 'undefined') {
+        return undefined;
+    }
+    if (grip.type === 'null') {
+        return null;
+    }
+    if (grip.type === 'longString') {
+        let full = grip.initial || '';
+        while (full.length < grip.length) {
+            const response = await client.request({
+                to: grip.actor,
+                type: 'substring',
+                start: full.length,
+                end: grip.length,
+            });
+            const chunk = typeof response.substring === 'string' ? response.substring : '';
+            if (!chunk) {
+                break;
+            }
+            full += chunk;
+        }
+        return full;
+    }
+    if (typeof grip.value !== 'undefined') {
+        return grip.value;
+    }
+    return grip;
+}
+
+/**
  * Wait for the `evaluationResult` RDP event carrying `resultID` and resolve with it.
  *
  * Results arrive as unsolicited `evaluationResult` events, which connectExtensionRdp()
@@ -153,10 +198,11 @@ async function sendEvaluate(client, consoleActor, text) {
 }
 
 /**
- * Read an evaluationResult's value as a string.
+ * Read an evaluationResult's value as a string, reassembling it from a longString grip
+ * when it exceeds the RDP inline limit (~10KB).
  */
 async function readResultString(client, result) {
-    const value = result.result;
+    const value = await resolveGrip(client, result.result);
     if (typeof value !== 'string') {
         throw new Error(`Unexpected result type: ${typeof value}`);
     }
@@ -173,7 +219,8 @@ async function readResultString(client, result) {
  * slot which we read back until it's ready. A fixed slot is safe (never needs cleanup)
  * because evaluate() calls are serialised per background page (FirefoxBackgroundPage._evalLock).
  * Synchronous results are returned inline. Every round-trip's result is awaited via push
- * (waitForEvaluationResult) rather than polled.
+ * (waitForEvaluationResult) rather than polled, and large results (longString grips) are
+ * reassembled by resolveGrip — so this stays fast and works regardless of result size.
  */
 async function evaluateInFirefoxBackground(client, consoleActor, evalResults, code) {
     if (!consoleActor) {
