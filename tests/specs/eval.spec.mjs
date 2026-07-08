@@ -48,4 +48,51 @@ test.describe('Background script eval', () => {
         const name = await backgroundPage.evaluate(() => chrome.runtime.getManifest().name);
         expect(name).toMatch(/^Harness Test Extension/);
     });
+
+    test('resolves a promise result', async ({ backgroundPage }) => {
+        const value = await backgroundPage.evaluate(() => Promise.resolve(21 * 2));
+        expect(value).toBe(42);
+    });
+
+    test('resolves a promise that settles after a delay', async ({ backgroundPage }) => {
+        // The value isn't ready on the first read of the result slot, so this exercises
+        // the re-read loop rather than the immediate path.
+        const value = await backgroundPage.evaluate(
+            (ms) => new Promise((resolve) => setTimeout(() => resolve('delayed'), ms)),
+            200,
+        );
+        expect(value).toBe('delayed');
+    });
+
+    test('propagates a synchronous error', async ({ backgroundPage }) => {
+        await expect(
+            backgroundPage.evaluate(() => {
+                throw new Error('sync boom');
+            }),
+        ).rejects.toThrow('sync boom');
+    });
+
+    test('propagates a rejected promise', async ({ backgroundPage }) => {
+        await expect(backgroundPage.evaluate(() => Promise.reject(new Error('async boom')))).rejects.toThrow('async boom');
+    });
+
+    test('round-trips falsy return values', async ({ backgroundPage }) => {
+        expect(await backgroundPage.evaluate(() => undefined)).toBeUndefined();
+        expect(await backgroundPage.evaluate(() => null)).toBeNull();
+        expect(await backgroundPage.evaluate(() => false)).toBe(false);
+        expect(await backgroundPage.evaluate(() => 0)).toBe(0);
+        expect(await backgroundPage.evaluate(() => '')).toBe('');
+    });
+
+    test('waitForFunction resolves once its predicate is true', async ({ backgroundPage }) => {
+        // Flip a global after a short delay; waitForFunction polls via evaluate() until true.
+        await backgroundPage.evaluate(() => {
+            globalThis.__ready = false;
+            setTimeout(() => {
+                globalThis.__ready = true;
+            }, 150);
+        });
+        const result = await backgroundPage.waitForFunction(() => globalThis.__ready === true);
+        expect(result).toBe(true);
+    });
 });

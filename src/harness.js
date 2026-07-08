@@ -104,8 +104,76 @@ async function ensureFirefoxPatched() {
 }
 
 /**
- * Evaluate JavaScript code in the Firefox extension's background page via RDP.
- * Handles async/Promise results using a callback mechanism.
+ * Wait for the `evaluationResult` RDP event carrying `resultID` and resolve with it.
+ *
+ * Results arrive as unsolicited `evaluationResult` events, which connectExtensionRdp()
+ * buffers into `evalResults` and re-emits on the client as `evaluationResult:<resultID>`.
+ * We resolve the moment that event fires (push) rather than polling, falling back to
+ * the buffer for the rare case the event landed before we started waiting.
+ */
+function waitForEvaluationResult(client, evalResults, resultID, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        // The result may already have arrived between sending the request and now.
+        if (evalResults.has(resultID)) {
+            const buffered = evalResults.get(resultID);
+            evalResults.delete(resultID);
+            resolve(buffered);
+            return;
+        }
+        const eventName = `evaluationResult:${resultID}`;
+        const onResult = (message) => {
+            clearTimeout(timer);
+            evalResults.delete(resultID);
+            resolve(message);
+        };
+        const timer = setTimeout(() => {
+            client.off(eventName, onResult);
+            const connState = client._rdpConnection ? 'connected' : 'disconnected';
+            reject(new Error(`Timeout waiting for evaluation result (resultID: ${resultID}, conn: ${connState})`));
+        }, timeoutMs);
+        client.once(eventName, onResult);
+    });
+}
+
+/**
+ * Send an evaluateJSAsync request and return its acknowledgement, which carries the
+ * resultID the eventual evaluationResult event is keyed by.
+ */
+async function sendEvaluate(client, consoleActor, text) {
+    let request;
+    try {
+        request = await client.request({ to: consoleActor, type: 'evaluateJSAsync', text });
+    } catch (e) {
+        throw new Error(`RDP evaluateJSAsync request failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!request.resultID) {
+        throw new Error(`RDP evaluateJSAsync did not return a resultID: ${JSON.stringify(request)}`);
+    }
+    return request;
+}
+
+/**
+ * Read an evaluationResult's value as a string.
+ */
+async function readResultString(client, result) {
+    const value = result.result;
+    if (typeof value !== 'string') {
+        throw new Error(`Unexpected result type: ${typeof value}`);
+    }
+    return value;
+}
+
+/**
+ * Evaluate JavaScript code in the Firefox extension's background page via RDP and
+ * return its result.
+ *
+ * evaluateJSAsync does NOT await a promise the evaluated expression returns — it hands
+ * back a grip of the still-pending promise — so a promise result is resolved with a small
+ * dance: the evaluated code stashes the settled, JSON-serialised value on a globalThis
+ * slot which we read back until it's ready. A fixed slot is safe (never needs cleanup)
+ * because evaluate() calls are serialised per background page (FirefoxBackgroundPage._evalLock).
+ * Synchronous results are returned inline. Every round-trip's result is awaited via push
+ * (waitForEvaluationResult) rather than polled.
  */
 async function evaluateInFirefoxBackground(client, consoleActor, evalResults, code) {
     if (!consoleActor) {
@@ -117,139 +185,64 @@ async function evaluateInFirefoxBackground(client, consoleActor, evalResults, co
         throw new Error('RDP client is not connected');
     }
 
-    const callbackId = `__evalCallback_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
     const wrappedCode = `
-        (function() {
+        (function () {
             try {
-                let __result__ = (function() { return ${code}; })();
+                var __result__ = (function () { return (${code}); })();
                 if (__result__ && typeof __result__.then === 'function') {
-                    globalThis.${callbackId} = { pending: true };
-                    __result__.then(function(val) {
-                        globalThis.${callbackId} = { pending: false, value: JSON.stringify({ __ok__: true, __value__: val }) };
-                    }).catch(function(e) {
-                        globalThis.${callbackId} = { pending: false, value: JSON.stringify({ __ok__: false, __error__: e.message }) };
-                    });
-                    return JSON.stringify({ __pending__: true, __callbackId__: ${JSON.stringify(callbackId)} });
+                    globalThis.__ddgHarnessEval = { pending: true };
+                    Promise.resolve(__result__).then(
+                        function (value) {
+                            globalThis.__ddgHarnessEval = { pending: false, value: JSON.stringify({ __ok__: true, __value__: value }) };
+                        },
+                        function (error) {
+                            globalThis.__ddgHarnessEval = { pending: false, value: JSON.stringify({ __ok__: false, __error__: (error && error.message) || String(error) }) };
+                        },
+                    );
+                    return JSON.stringify({ __pending__: true });
                 }
                 return JSON.stringify({ __ok__: true, __value__: __result__ });
-            } catch (e) {
-                return JSON.stringify({ __ok__: false, __error__: e.message });
+            } catch (error) {
+                return JSON.stringify({ __ok__: false, __error__: (error && error.message) || String(error) });
             }
         })()
     `;
 
-    let evalRequest;
-    try {
-        evalRequest = await client.request({
-            to: consoleActor,
-            type: 'evaluateJSAsync',
-            text: wrappedCode,
-        });
-    } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        throw new Error(`RDP evaluateJSAsync request failed: ${message}`);
-    }
-
-    if (!evalRequest.resultID) {
-        throw new Error(`RDP evaluateJSAsync did not return a resultID: ${JSON.stringify(evalRequest)}`);
-    }
-
-    const timeout = 30000;
-    const startTime = Date.now();
-    while (!evalResults.has(evalRequest.resultID)) {
-        if (Date.now() - startTime > timeout) {
-            // Check if connection is still active (web-ext uses _rdpConnection)
-            const connState = client._rdpConnection ? 'connected' : 'disconnected';
-            const pendingCount = evalResults.size;
-            const existingResultIds = Array.from(evalResults.keys()).join(', ');
-            throw new Error(
-                `Timeout waiting for evaluation result (resultID: ${evalRequest.resultID}, conn: ${connState}, pendingResults: ${pendingCount}, existingIds: [${existingResultIds}])`,
-            );
-        }
-        await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-
-    const result = evalResults.get(evalRequest.resultID);
-    evalResults.delete(evalRequest.resultID);
-
+    const evalRequest = await sendEvaluate(client, consoleActor, wrappedCode);
+    const result = await waitForEvaluationResult(client, evalResults, evalRequest.resultID, 30000);
     if (result.hasException) {
         throw new Error(`Evaluation error: ${result.exceptionMessage}`);
     }
+    const parsed = JSON.parse(await readResultString(client, result));
 
-    const resultValue = result.result;
-    if (typeof resultValue === 'object' && resultValue !== null) {
-        if (resultValue.type === 'undefined') return undefined;
-        if (typeof resultValue.value !== 'undefined') return resultValue.value;
-    }
-    if (typeof resultValue !== 'string') {
-        throw new Error(`Unexpected result type: ${typeof resultValue}`);
-    }
-
-    const parsed = JSON.parse(resultValue);
-
-    // Handle pending async result
-    if (parsed.__pending__) {
-        const pendingCallbackId = parsed.__callbackId__;
-        const asyncTimeout = 30000;
-        const asyncStartTime = Date.now();
-        while (Date.now() - asyncStartTime < asyncTimeout) {
-            const checkCode = `JSON.stringify(globalThis.${pendingCallbackId})`;
-            const checkRequest = await client.request({
-                to: consoleActor,
-                type: 'evaluateJSAsync',
-                text: checkCode,
-            });
-            while (!evalResults.has(checkRequest.resultID)) {
-                if (Date.now() - asyncStartTime > asyncTimeout) {
-                    throw new Error('Timeout waiting for async result');
-                }
-                await new Promise((resolve) => setTimeout(resolve, 50));
-            }
-            const checkResult = evalResults.get(checkRequest.resultID);
-            evalResults.delete(checkRequest.resultID);
-            if (checkResult.hasException) {
-                throw new Error(`Async check error: ${checkResult.exceptionMessage}`);
-            }
-            // Firefox RDP may wrap the result in a `{ type, value }` grip the
-            // same way the initial result handler above unwraps. Mirror that
-            // logic so a wrapped value isn't mistaken for "callback not set".
-            let checkStr = checkResult.result;
-            if (typeof checkStr === 'object' && checkStr !== null && typeof checkStr.value !== 'undefined') {
-                checkStr = checkStr.value;
-            }
-            if (typeof checkStr === 'string') {
-                const checkParsed = JSON.parse(checkStr);
-                if (!checkParsed.pending) {
-                    // Clean up - must await and consume the evaluationResult to avoid leftover results
-                    const cleanupRequest = await client.request({
-                        to: consoleActor,
-                        type: 'evaluateJSAsync',
-                        text: `delete globalThis.${pendingCallbackId}`,
-                    });
-                    // Wait for and consume the cleanup's evaluationResult
-                    const cleanupTimeout = Date.now() + 5000;
-                    while (!evalResults.has(cleanupRequest.resultID)) {
-                        if (Date.now() > cleanupTimeout) break; // Don't block forever on cleanup
-                        await new Promise((resolve) => setTimeout(resolve, 50));
-                    }
-                    evalResults.delete(cleanupRequest.resultID);
-
-                    const finalParsed = JSON.parse(checkParsed.value);
-                    if (!finalParsed.__ok__) {
-                        throw new Error(`Evaluation error: ${finalParsed.__error__}`);
-                    }
-                    return finalParsed.__value__;
-                }
-            }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+    // Synchronous result — done.
+    if (!parsed.__pending__) {
+        if (!parsed.__ok__) {
+            throw new Error(`Evaluation error: ${parsed.__error__}`);
         }
-        throw new Error('Timeout waiting for async evaluation result');
+        return parsed.__value__;
     }
 
-    if (!parsed.__ok__) {
-        throw new Error(`Evaluation error: ${parsed.__error__}`);
+    // Promise result — read the slot back until the promise has settled.
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+        const checkRequest = await sendEvaluate(client, consoleActor, 'JSON.stringify(globalThis.__ddgHarnessEval)');
+        const checkResult = await waitForEvaluationResult(client, evalResults, checkRequest.resultID, 30000);
+        if (checkResult.hasException) {
+            throw new Error(`Async check error: ${checkResult.exceptionMessage}`);
+        }
+        const slot = JSON.parse(await readResultString(client, checkResult));
+        if (slot && !slot.pending) {
+            const finalParsed = JSON.parse(slot.value);
+            if (!finalParsed.__ok__) {
+                throw new Error(`Evaluation error: ${finalParsed.__error__}`);
+            }
+            return finalParsed.__value__;
+        }
+        // Not settled yet (rare for a fast promise) — brief backoff before re-reading.
+        await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    return parsed.__value__;
+    throw new Error('Timeout waiting for async evaluation result');
 }
 
 /**
@@ -454,7 +447,11 @@ async function connectExtensionRdp(rdpPort) {
     const workerTargets = [];
     client.on('unsolicited-event', (msg) => {
         if (msg.type === 'evaluationResult') {
+            // Buffer the result (in case a waiter hasn't attached yet) and notify any
+            // active waiter immediately — waitForEvaluationResult() resolves on this
+            // event rather than polling the map.
             evalResults.set(msg.resultID, msg);
+            client.emit(`evaluationResult:${msg.resultID}`, msg);
         }
         if (msg.type === 'target-available-form' && msg.target && msg.target.url) {
             workerTargets.push(msg.target);
