@@ -1,6 +1,6 @@
 {
     "name": "firefox-webext-playwright-harness",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "description": "Experimental harness for running a Firefox browser extension's Playwright integration tests.",
     "license": "Apache-2.0",
     "repository": "https://github.com/kzar/firefox-webext-playwright-harness",
