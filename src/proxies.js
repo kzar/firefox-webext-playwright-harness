@@ -21,12 +21,17 @@ const UNSUBSCRIBE_METHODS = new Set(['off', 'removeListener']);
  * @template T
  * @param {T} target - real Playwright Page or BrowserContext
  * @param {import('./network-bridge.js').NetworkEventBridge} bridge
- * @param {{ onRoute?: (pattern: any, handler: any) => Promise<void> }} [options]
- *   onRoute (context only): also register the route with the harness web server,
- *   so XPCOM-redirected extension requests can be fulfilled by the same handler.
+ * @param {{
+ *   onRoute?: (pattern: any, handler: any) => Promise<void>,
+ *   onUnroute?: (pattern: any, handler: any) => Promise<void>,
+ *   onUnrouteAll?: () => Promise<void>,
+ * }} [options]
+ *   onRoute / onUnroute / onUnrouteAll (context only): also register/unregister
+ *   the route with the harness web server, so XPCOM-redirected extension
+ *   requests are matched by the same handlers as content-page requests.
  * @returns {T}
  */
-function wrapWithNetworkBridge(target, bridge, { onRoute } = {}) {
+function wrapWithNetworkBridge(target, bridge, { onRoute, onUnroute, onUnrouteAll } = {}) {
     const proxy = new Proxy(target, {
         get(t, prop) {
             if (SUBSCRIBE_METHODS.has(prop) || UNSUBSCRIBE_METHODS.has(prop) || prop === 'once') {
@@ -50,8 +55,25 @@ function wrapWithNetworkBridge(target, bridge, { onRoute } = {}) {
                 return async (...args) => {
                     // Register on the real context (content-page routing) AND with
                     // the web server (extension background requests via XPCOM).
+                    if (args[2] !== undefined) {
+                        // The web server ignores route options; content-page routing
+                        // still honours them via the real context.route().
+                        console.warn('firefox-webext-playwright-harness: route() options are not applied to extension background requests');
+                    }
                     await Reflect.apply(t.route, t, args);
                     await onRoute(args[0], args[1]);
+                };
+            }
+            if (onUnroute && prop === 'unroute') {
+                return async (...args) => {
+                    await Reflect.apply(t.unroute, t, args);
+                    await onUnroute(args[0], args[1]);
+                };
+            }
+            if (onUnrouteAll && prop === 'unrouteAll') {
+                return async (...args) => {
+                    await Reflect.apply(t.unrouteAll, t, args);
+                    await onUnrouteAll();
                 };
             }
             const value = Reflect.get(t, prop, t);

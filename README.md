@@ -40,8 +40,6 @@ export default defineConfig({
     globalSetup: 'firefox-webext-playwright-harness/globalSetup',
     use: {
         firefoxHarnessConfig: {
-            // The extension's Firefox add-on ID (from its manifest).
-            addonId: 'your-addon@example.com',
             // Absolute path to the built, unpacked Firefox extension to install.
             extensionPath: path.join(process.cwd(), 'build/firefox/dev'),
             // Optional ordered [from, to] rewrites applied to a redirected
@@ -77,6 +75,30 @@ if (isFirefox()) {
 export { test };
 ```
 
+### Route handlers for background requests
+
+The extension's background `http(s)` requests are redirected to a local harness server that
+runs the same Playwright-style route handlers you register with `context.route(...)`. The
+`route` object passed to those handlers follows Playwright's `Route` contract:
+
+- `route.fulfill({ status, headers, body })` — also supports `contentType`, `json`, and
+  `path` (read from disk), with Playwright's precedence (`json`/`path` over `body`).
+- `route.request()` — exposes `url()`, `method()`, `headers()`, `postData()`,
+  `postDataBuffer()`, and `postDataJSON()`.
+- `route.continue()` — sends the request to the real origin, **skipping any remaining
+  handlers** (redirects are relayed to the extension, not silently followed).
+- `route.fallback()` — defers to the next matching handler, then the base handler, then
+  the origin.
+- `route.abort([errorCode])` — fails the request (the extension's `fetch` rejects), rather
+  than returning an empty success.
+
+Only string glob patterns registered via `context.route()` are matched for background
+requests; RegExp/function matchers apply to content-page requests only. `route()` options
+(e.g. `{ times }`) are not applied to background requests.
+
+Extensions using either `background.scripts` or `background.page` in their manifest are
+supported.
+
 ## Standalone usage (without @playwright/test)
 
 For cases where you just need to evaluate code in the extension's background context, e.g. unit
@@ -88,7 +110,6 @@ const { launchExtensionBackground } = require('firefox-webext-playwright-harness
 
 const { background, close } = await launchExtensionBackground({
     extensionPath: '/path/to/built/extension',
-    addonId: 'your-addon@example.com',
     firefoxUserPrefs: { 'extensions.dnr.feedback': true },
 });
 
@@ -111,7 +132,13 @@ Note: Pages opened in this browser are not routed or bridged, so they aren't usa
 npm install
 npx playwright install firefox
 
-# Run the tests.
+# Unit tests for the RDP client and glob matching (no browser needed).
+npm run test:unit
+
+# Standalone launchExtensionBackground tests (stock, unpatched Firefox).
+npm run test:standalone
+
+# Run the Playwright test suite.
 npm run playwright
 
 # Stress-test to catch flakes.

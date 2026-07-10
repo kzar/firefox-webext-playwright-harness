@@ -2,6 +2,10 @@
  * Firefox can't use Playwright's `page.addScriptTag` on the pages under test
  * (it's blocked by their CSP), so inject the script's contents via evaluate()
  * instead. Works on a Page or a Frame.
+ *
+ * Known divergences from Playwright's addScriptTag: resolves with undefined
+ * rather than an ElementHandle for the injected <script>, and the `type` option
+ * is ignored (path/content/url are supported).
  */
 const fs = require('fs/promises');
 

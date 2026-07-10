@@ -1,0 +1,13 @@
+{
+    "manifest_version": 2,
+    "name": "Harness Test Extension (Background Page)",
+    "version": "1.0.0",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "harness-test-background-page@example.com"
+        }
+    },
+    "background": {
+        "page": "background.html"
+    }
+}

@@ -33,7 +33,6 @@ export default defineConfig({
             name: 'firefox-mv2',
             use: {
                 firefoxHarnessConfig: {
-                    addonId: 'harness-test-mv2@example.com',
                     extensionPath: path.join(__dirname, 'fixtures', 'extension-mv2'),
                     rewriteStaticRules,
                 },
@@ -43,7 +42,6 @@ export default defineConfig({
             name: 'firefox-mv3',
             use: {
                 firefoxHarnessConfig: {
-                    addonId: 'harness-test-mv3@example.com',
                     extensionPath: path.join(__dirname, 'fixtures', 'extension-mv3'),
                     rewriteStaticRules,
                 },

@@ -4,7 +4,8 @@ const os = require('os');
 const path = require('path');
 const JSZip = require('jszip');
 const { firefox } = require('@playwright/test');
-const { connectToFirefox, findFreeTcpPort } = require('./web-ext-rdp.js');
+const { FirefoxRDPClient } = require('./web-ext-rdp.js');
+const { acquireRdpPort } = require('./rdp-port.js');
 const { FirefoxWebServer } = require('./web-server.js');
 
 function ensureTempPath(dirOrFilePath) {
@@ -15,7 +16,9 @@ function ensureTempPath(dirOrFilePath) {
 
 function rmTempDir(dirPath) {
     ensureTempPath(dirPath);
-    return fs.rm(dirPath, { recursive: true, force: true });
+    // Retry briefly: the OS can still be releasing file locks just after the
+    // browser process exits.
+    return fs.rm(dirPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 function rmTempDirSync(dirPath) {
@@ -36,9 +39,49 @@ process.on('exit', () => {
     }
 });
 
+/**
+ * Remove a tracked temp dir. On failure, warn and keep it in _tempDirs so the
+ * process-exit hook gets another go at it.
+ */
+async function removeTempDir(dirPath) {
+    try {
+        await rmTempDir(dirPath);
+        _tempDirs.delete(dirPath);
+    } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn(`Failed to remove temp dir ${dirPath}: ${message}`);
+    }
+}
+
 const helperExtensionPath = path.join(__dirname, 'xpcom-extension');
 
 const CFG_MARKER = '// --- Firefox Playwright Harness ---';
+
+/**
+ * Replace exactly one occurrence of `needle` in `content`, throwing a clear
+ * "incompatible Firefox build" error when it is missing or ambiguous.
+ *
+ * ensureFirefoxPatched relies on this: a silent String.replace no-op (e.g. because a
+ * future Playwright Firefox reformatted the patched line) would otherwise rewrite an
+ * unpatched omni.ja, still write the cfg marker, and permanently mark the install as
+ * patched — surfacing only as an opaque helper-init timeout much later.
+ */
+function replaceExactlyOnce(content, needle, replacement, fileLabel) {
+    const first = content.indexOf(needle);
+    if (first === -1) {
+        throw new Error(
+            `Firefox patch needle not found in ${fileLabel}: ${JSON.stringify(needle)}. ` +
+                'The harness is incompatible with this Playwright Firefox build.',
+        );
+    }
+    if (content.indexOf(needle, first + needle.length) !== -1) {
+        throw new Error(
+            `Firefox patch needle occurs more than once in ${fileLabel}: ${JSON.stringify(needle)}. ` +
+                'The harness is incompatible with this Playwright Firefox build.',
+        );
+    }
+    return content.slice(0, first) + replacement + content.slice(first + needle.length);
+}
 
 let _firefoxPatched = false;
 /**
@@ -69,95 +112,156 @@ async function ensureFirefoxPatched() {
     const cfgContent = await fs.readFile(cfgPath, 'utf8');
 
     if (!cfgContent.includes(CFG_MARKER)) {
-        // Patch omni.ja: enable EXPERIMENTS_ENABLED in AddonSettings.sys.mjs.
+        // Parallel Playwright workers patching the same install concurrently could
+        // corrupt omni.ja — the patch must be applied once, before workers start.
+        if (process.env.TEST_WORKER_INDEX !== undefined) {
+            throw new Error(
+                "Playwright's bundled Firefox has not been patched for the harness. Add " +
+                    "globalSetup: 'firefox-webext-playwright-harness/globalSetup' to your Playwright " +
+                    'config so the patch is applied once before test workers start.',
+            );
+        }
+        // Patch omni.ja. Compute both replacements up front (asserting each needle
+        // matches exactly once) BEFORE mutating the zip, so an incompatible Firefox
+        // build fails loudly here rather than silently writing an unpatched omni.ja.
         const omniPath = path.join(firefoxDir, 'omni.ja');
         const zip = await JSZip.loadAsync(await fs.readFile(omniPath));
+
         const addonSettingsFile = zip.file('modules/addons/AddonSettings.sys.mjs');
         if (!addonSettingsFile) throw new Error('AddonSettings.sys.mjs not found in omni.ja');
-        const addonSettings = await addonSettingsFile.async('string');
-        zip.file(
-            'modules/addons/AddonSettings.sys.mjs',
-            addonSettings.replace('makeConstant("EXPERIMENTS_ENABLED", false)', 'makeConstant("EXPERIMENTS_ENABLED", true)'),
+        const patchedAddonSettings = replaceExactlyOnce(
+            await addonSettingsFile.async('string'),
+            'makeConstant("EXPERIMENTS_ENABLED", false)',
+            'makeConstant("EXPERIMENTS_ENABLED", true)',
+            'omni.ja:modules/addons/AddonSettings.sys.mjs',
         );
-        // Patch JugglerFrameChild.jsm: neuter the moz-extension:// early return so
-        // Juggler can interact with extension pages opened as tabs.
+
         const jugglerChildFile = zip.file('chrome/juggler/content/content/JugglerFrameChild.jsm');
         if (!jugglerChildFile) throw new Error('JugglerFrameChild.jsm not found in omni.ja');
-        const jugglerChild = await jugglerChildFile.async('string');
-        zip.file(
-            'chrome/juggler/content/content/JugglerFrameChild.jsm',
-            jugglerChild.replace('moz-extension://', 'moz-extension-DISABLED://'),
+        const patchedJugglerChild = replaceExactlyOnce(
+            await jugglerChildFile.async('string'),
+            'moz-extension://',
+            'moz-extension-DISABLED://',
+            'omni.ja:chrome/juggler/content/content/JugglerFrameChild.jsm',
         );
 
-        await fs.writeFile(omniPath, await zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' }));
+        zip.file('modules/addons/AddonSettings.sys.mjs', patchedAddonSettings);
+        zip.file('chrome/juggler/content/content/JugglerFrameChild.jsm', patchedJugglerChild);
+
+        // Write-to-temp + rename so a crash mid-write can't leave a truncated omni.ja
+        // (Firefox would be unbootable until reinstalled). The cfg marker below is
+        // written only after omni.ja is safely in place, so a needle failure above
+        // never leaves an unpatched install marked as patched.
+        const omniTmpPath = `${omniPath}.tmp-${process.pid}`;
+        await fs.writeFile(omniTmpPath, await zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' }));
+        await fs.rename(omniTmpPath, omniPath);
 
         // Patch playwright.cfg: lock marionette.running for runtime experiment support.
+        const cfgTmpPath = `${cfgPath}.tmp-${process.pid}`;
         await fs.writeFile(
-            cfgPath,
+            cfgTmpPath,
             cfgContent +
                 ['', CFG_MARKER, 'lockPref("marionette.running", true);', '// --- End Firefox Playwright Harness ---'].join('\n') +
                 '\n',
         );
+        await fs.rename(cfgTmpPath, cfgPath);
     }
 
     _firefoxPatched = true;
+}
+
+// Budget for a single RDP request (and the initial connect handshake). RDP matches
+// replies to requests by actor with no request IDs, so a request left unanswered can't
+// be cancelled in isolation — a late reply would be misattributed to the next request
+// on that actor. A request silent for this long therefore means the connection is dead,
+// so on timeout we reject with a descriptive error AND tear the connection down (which
+// fails every queued request fast via 'disconnect').
+const RDP_REQUEST_TIMEOUT_MS = 30000;
+
+function withRdpDeadline(client, promise, timeoutMs, what) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`RDP request timed out after ${timeoutMs}ms: ${what} — closing the RDP connection`));
+            client.disconnect();
+        }, timeoutMs);
+        timer.unref?.();
+        promise.then(
+            (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            (err) => {
+                clearTimeout(timer);
+                reject(err);
+            },
+        );
+    });
+}
+
+/**
+ * Send an RDP request bounded by a deadline. `what` names the request in the timeout
+ * error. Used for every harness RDP request so a wedged-but-alive Firefox can't hang
+ * setup or evaluate() indefinitely (the vendored request() itself has no timeout).
+ */
+function rdpRequest(client, requestProps, { timeoutMs = RDP_REQUEST_TIMEOUT_MS, what } = {}) {
+    const label = what ?? (typeof requestProps === 'string' ? requestProps : requestProps.type);
+    return withRdpDeadline(client, client.request(requestProps), timeoutMs, label);
 }
 
 /**
  * Resolve a Firefox RDP "grip" (the value shape carried in evaluationResult.result)
  * into a plain JS value.
  *
- * Primitives arrive as-is; `{ type: 'undefined' }` / `{ type: 'null' }` map to
- * undefined/null; a `{ type, value }` wrapper is unwrapped; and a longString grip
- * (`{ type: 'longString', initial, length, actor }`, returned whenever a string
- * exceeds the RDP inline limit of ~10KB) is fully reassembled by fetching the
- * remainder from its actor via `substring`. Without the longString handling a large
- * evaluate() result stays an unrecognised object, so the caller never sees it resolve
- * and polls until timeout.
+ * Only two shapes can legitimately occur here: primitives (the evaluate wrapper's
+ * completion value is always a JSON string, and exceptionMessage is a string), which
+ * arrive as-is; and a longString grip (`{ type: 'longString', initial, length, actor }`,
+ * returned whenever a string exceeds the RDP inline limit of ~10KB), which is
+ * reassembled by fetching the remainder from its actor via `substring`. Anything else
+ * is a protocol surprise and throws an error naming the grip.
  */
 async function resolveGrip(client, grip) {
     if (grip === null || typeof grip !== 'object') {
         return grip;
     }
-    if (grip.type === 'undefined') {
-        return undefined;
-    }
-    if (grip.type === 'null') {
-        return null;
-    }
     if (grip.type === 'longString') {
         let full = grip.initial || '';
         while (full.length < grip.length) {
-            const response = await client.request({
-                to: grip.actor,
-                type: 'substring',
-                start: full.length,
-                end: grip.length,
-            });
+            const response = await rdpRequest(
+                client,
+                {
+                    to: grip.actor,
+                    type: 'substring',
+                    start: full.length,
+                    end: grip.length,
+                },
+                { what: 'substring (longString reassembly)' },
+            );
             const chunk = typeof response.substring === 'string' ? response.substring : '';
             if (!chunk) {
-                break;
+                throw new Error(`longString grip truncated: got ${full.length} of ${grip.length} characters`);
             }
             full += chunk;
         }
         return full;
     }
-    if (typeof grip.value !== 'undefined') {
-        return grip.value;
-    }
-    return grip;
+    throw new Error(
+        `Unexpected evaluate result grip (type: ${grip.type || 'none'}, class: ${grip.class || 'none'})` +
+            (grip.class === 'Promise' ? " — got a pending Promise grip; does this Firefox support evaluateJSAsync's mapped: { await: true }?" : ''),
+    );
 }
 
 /**
  * Wait for the `evaluationResult` RDP event carrying `resultID` and resolve with it.
  *
  * Results arrive as unsolicited `evaluationResult` events, which connectExtensionRdp()
- * buffers into `evalResults` and re-emits on the client as `evaluationResult:<resultID>`.
- * We resolve the moment that event fires (push) rather than polling, falling back to
- * the buffer for the rare case the event landed before we started waiting.
+ * buffers into the client's `_evalResults` map and re-emits on the client as
+ * `evaluationResult:<resultID>`. We resolve the moment that event fires (push) rather
+ * than polling, falling back to the buffer for the rare case the event landed before we
+ * started waiting.
  */
-function waitForEvaluationResult(client, evalResults, resultID, timeoutMs) {
+function waitForEvaluationResult(client, resultID, timeoutMs) {
     return new Promise((resolve, reject) => {
+        const evalResults = client._evalResults;
         // The result may already have arrived between sending the request and now.
         if (evalResults.has(resultID)) {
             const buffered = evalResults.get(resultID);
@@ -165,29 +269,53 @@ function waitForEvaluationResult(client, evalResults, resultID, timeoutMs) {
             resolve(buffered);
             return;
         }
+        // The connection may already be gone (teardown raced the request's ack) —
+        // fail fast rather than waiting out the timeout for an event that can't come.
+        if (!client._rdpConnection) {
+            reject(new Error('RDP connection closed while waiting for evaluation result'));
+            return;
+        }
         const eventName = `evaluationResult:${resultID}`;
-        const onResult = (message) => {
+        const cleanup = () => {
             clearTimeout(timer);
+            client.off(eventName, onResult);
+            client.off('disconnect', onDisconnect);
             evalResults.delete(resultID);
+        };
+        const onResult = (message) => {
+            cleanup();
             resolve(message);
         };
+        const onDisconnect = (error) => {
+            cleanup();
+            reject(new Error(`RDP connection closed while waiting for evaluation result: ${error?.message || error}`));
+        };
         const timer = setTimeout(() => {
-            client.off(eventName, onResult);
-            const connState = client._rdpConnection ? 'connected' : 'disconnected';
-            reject(new Error(`Timeout waiting for evaluation result (resultID: ${resultID}, conn: ${connState})`));
+            cleanup();
+            reject(new Error(`Timeout waiting for evaluation result (resultID: ${resultID})`));
         }, timeoutMs);
+        timer.unref?.();
         client.once(eventName, onResult);
+        client.once('disconnect', onDisconnect);
     });
 }
 
 /**
  * Send an evaluateJSAsync request and return its acknowledgement, which carries the
  * resultID the eventual evaluationResult event is keyed by.
+ *
+ * `mapped: { await: true }` makes the console actor await a Promise completion value
+ * server-side, so the evaluationResult event carries the settled value rather than a
+ * pending-promise grip. Non-Promise completion values are unaffected by the flag.
  */
 async function sendEvaluate(client, consoleActor, text) {
     let request;
     try {
-        request = await client.request({ to: consoleActor, type: 'evaluateJSAsync', text });
+        request = await rdpRequest(
+            client,
+            { to: consoleActor, type: 'evaluateJSAsync', text, mapped: { await: true } },
+            { what: 'evaluateJSAsync' },
+        );
     } catch (e) {
         throw new Error(`RDP evaluateJSAsync request failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -209,20 +337,40 @@ async function readResultString(client, result) {
     return value;
 }
 
+// Budget for one whole evaluate round trip: RDP delivery of the ack and result event,
+// including the server-side await of the evaluated promise.
+const EVAL_RESULT_TIMEOUT_MS = 30000;
+
+/**
+ * Rebuild an Error thrown/rejected in the background context from the details the
+ * evaluate wrapper serialised ({ message, name, stack }), preserving the remote error
+ * name and appending the remote stack for diagnosis.
+ */
+function buildRemoteError(details) {
+    const error = new Error(`Evaluation error: ${details.message}`);
+    if (details.name && details.name !== 'Error') {
+        error.name = details.name;
+    }
+    if (details.stack) {
+        error.stack += `\nCaused by (remote): ${details.stack}`;
+    }
+    return error;
+}
+
 /**
  * Evaluate JavaScript code in the Firefox extension's background page via RDP and
  * return its result.
  *
- * evaluateJSAsync does NOT await a promise the evaluated expression returns — it hands
- * back a grip of the still-pending promise — so a promise result is resolved with a small
- * dance: the evaluated code stashes the settled, JSON-serialised value on a globalThis
- * slot which we read back until it's ready. A fixed slot is safe (never needs cleanup)
- * because evaluate() calls are serialised per background page (FirefoxBackgroundPage._evalLock).
- * Synchronous results are returned inline. Every round-trip's result is awaited via push
- * (waitForEvaluationResult) rather than polled, and large results (longString grips) are
- * reassembled by resolveGrip — so this stays fast and works regardless of result size.
+ * The code is wrapped in an async IIFE whose completion value is a Promise, which the
+ * console actor awaits server-side (mapped.await on the evaluateJSAsync request), so a
+ * single pushed evaluationResult event carries the settled value — one round trip per
+ * evaluate, however long the promise takes to settle. The wrapper always resolves,
+ * serialising errors ({ message, name, stack }) into the JSON envelope, because a
+ * rejected promise reaching the actor's awaited path is reported as just
+ * { topLevelAwaitRejected: true } with no rejection reason. Large results (longString
+ * grips) are reassembled by resolveGrip, so this works regardless of result size.
  */
-async function evaluateInFirefoxBackground(client, consoleActor, evalResults, code) {
+async function evaluateInFirefoxBackground(client, consoleActor, code) {
     if (!consoleActor) {
         throw new Error('No background console actor available');
     }
@@ -232,78 +380,87 @@ async function evaluateInFirefoxBackground(client, consoleActor, evalResults, co
         throw new Error('RDP client is not connected');
     }
 
+    // The evaluated code is emitted on its own lines inside the parens so a trailing
+    // line comment in a string expression can't comment out the closing tokens.
     const wrappedCode = `
-        (function () {
+        (async function () {
             try {
-                var __result__ = (function () { return (${code}); })();
-                if (__result__ && typeof __result__.then === 'function') {
-                    globalThis.__ddgHarnessEval = { pending: true };
-                    Promise.resolve(__result__).then(
-                        function (value) {
-                            globalThis.__ddgHarnessEval = { pending: false, value: JSON.stringify({ __ok__: true, __value__: value }) };
-                        },
-                        function (error) {
-                            globalThis.__ddgHarnessEval = { pending: false, value: JSON.stringify({ __ok__: false, __error__: (error && error.message) || String(error) }) };
-                        },
-                    );
-                    return JSON.stringify({ __pending__: true });
-                }
+                var __result__ = await (function () { return (
+${code}
+); })();
                 return JSON.stringify({ __ok__: true, __value__: __result__ });
             } catch (error) {
-                return JSON.stringify({ __ok__: false, __error__: (error && error.message) || String(error) });
+                var details = { message: '', name: 'Error', stack: '' };
+                try {
+                    if (error && typeof error.message === 'string') {
+                        details.message = error.message;
+                        details.name = (error.name && String(error.name)) || 'Error';
+                        details.stack = (error.stack && String(error.stack)) || '';
+                    } else if (error && typeof error === 'object') {
+                        details.message = JSON.stringify(error);
+                    } else {
+                        details.message = String(error);
+                    }
+                } catch (serializationError) {
+                    details.message = String(error);
+                }
+                return JSON.stringify({ __ok__: false, __error__: details });
             }
         })()
     `;
 
     const evalRequest = await sendEvaluate(client, consoleActor, wrappedCode);
-    const result = await waitForEvaluationResult(client, evalResults, evalRequest.resultID, 30000);
+    const result = await waitForEvaluationResult(client, evalRequest.resultID, EVAL_RESULT_TIMEOUT_MS);
     if (result.hasException) {
-        throw new Error(`Evaluation error: ${result.exceptionMessage}`);
+        // exceptionMessage can itself arrive as a longString grip.
+        const exceptionMessage = await resolveGrip(client, result.exceptionMessage);
+        throw new Error(`Evaluation error: ${exceptionMessage}`);
+    }
+    if (result.topLevelAwaitRejected) {
+        // Unreachable unless the wrapper's own catch block throws or the wrapper is
+        // bypassed — kept for a clear error over a cryptic missing-result failure.
+        throw new Error('Evaluation error: promise rejected');
     }
     const parsed = JSON.parse(await readResultString(client, result));
-
-    // Synchronous result — done.
-    if (!parsed.__pending__) {
-        if (!parsed.__ok__) {
-            throw new Error(`Evaluation error: ${parsed.__error__}`);
-        }
-        return parsed.__value__;
+    if (!parsed.__ok__) {
+        throw buildRemoteError(parsed.__error__);
     }
+    return parsed.__value__;
+}
 
-    // Promise result — read the slot back until the promise has settled.
-    const deadline = Date.now() + 30000;
-    while (Date.now() < deadline) {
-        const checkRequest = await sendEvaluate(client, consoleActor, 'JSON.stringify(globalThis.__ddgHarnessEval)');
-        const checkResult = await waitForEvaluationResult(client, evalResults, checkRequest.resultID, 30000);
-        if (checkResult.hasException) {
-            throw new Error(`Async check error: ${checkResult.exceptionMessage}`);
-        }
-        const slot = JSON.parse(await readResultString(client, checkResult));
-        if (slot && !slot.pending) {
-            const finalParsed = JSON.parse(slot.value);
-            if (!finalParsed.__ok__) {
-                throw new Error(`Evaluation error: ${finalParsed.__error__}`);
-            }
-            return finalParsed.__value__;
-        }
-        // Not settled yet (rare for a fast promise) — brief backoff before re-reading.
-        await new Promise((resolve) => setTimeout(resolve, 25));
+/**
+ * Serialise one evaluate() argument into JS source. JSON covers everything Playwright's
+ * evaluate contract supports over this transport; `undefined` becomes the literal
+ * `undefined` (JSON.stringify would return the *value* undefined, corrupting the
+ * generated argument list), and unserialisable values fail loudly rather than
+ * generating a SyntaxError or silently dropping the argument. Inherent JSON
+ * round-trip lossiness remains: NaN/Infinity become null, -0 becomes 0, and Dates
+ * become strings.
+ */
+function serializeEvalArg(arg, index) {
+    if (arg === undefined) {
+        return 'undefined';
     }
-    throw new Error('Timeout waiting for async evaluation result');
+    const json = JSON.stringify(arg);
+    if (json === undefined) {
+        throw new Error(`Unsupported evaluate() argument at index ${index}: ${typeof arg} is not serializable`);
+    }
+    return json;
 }
 
 /**
  * Wrapper class providing background page functionality for Firefox via RDP.
  * Provides an API similar to Playwright's Page/Worker for evaluate() calls.
  *
- * Important: All evaluate() calls are serialized via a lock to prevent RDP
- * concurrency issues where evaluation results can arrive out of order.
+ * evaluate() calls are serialised via a lock so concurrent callers' code runs one at
+ * a time in the background context, keeping side-effect ordering predictable.
+ * (Results themselves are matched by resultID, so this is a semantic choice, not a
+ * transport requirement.)
  */
 class FirefoxBackgroundPage {
-    constructor(rdpClient, consoleActor, evalResults) {
+    constructor(rdpClient, consoleActor) {
         this._client = rdpClient;
         this._consoleActor = consoleActor;
-        this._evalResults = evalResults;
         this._evalLock = Promise.resolve(); // Lock for serializing evaluate calls
     }
 
@@ -314,44 +471,54 @@ class FirefoxBackgroundPage {
         let code;
         if (typeof pageFunction === 'function') {
             const fnStr = pageFunction.toString();
-            if (args.length > 0) {
-                const serializedArgs = args.map((arg) => JSON.stringify(arg)).join(', ');
-                code = `(${fnStr})(${serializedArgs})`;
-            } else {
-                code = `(${fnStr})()`;
-            }
+            const serializedArgs = args.map(serializeEvalArg).join(', ');
+            code = `(${fnStr})(${serializedArgs})`;
         } else {
             code = String(pageFunction);
         }
-        // Serialize all evaluate calls to prevent RDP concurrency issues
-        const prevLock = this._evalLock;
-        /** @type {(value?: unknown) => void} */
-        let releaseLock = () => {};
-        this._evalLock = new Promise((resolve) => {
-            releaseLock = resolve;
-        });
-        try {
-            await prevLock;
-            return await evaluateInFirefoxBackground(this._client, this._consoleActor, this._evalResults, code);
-        } finally {
-            releaseLock();
-        }
+        // Serialize evaluate calls (see the class doc comment). A rejected evaluation
+        // must still release the lock for the next caller, hence the swallowed
+        // continuation stored on _evalLock.
+        const run = this._evalLock.then(() => evaluateInFirefoxBackground(this._client, this._consoleActor, code));
+        this._evalLock = run.then(
+            () => {},
+            () => {},
+        );
+        return run;
     }
 
     // Playwright signature: (pageFunction, arg, options). backgroundWait.js
     // (forFunction/forSetting) calls this Playwright-style.
-    async waitForFunction(pageFunction, arg, options = {}) {
-        const { timeout = 30000, polling = 100 } = options;
+    async waitForFunction(pageFunction, arg, options) {
+        const { timeout = 30000, polling = 100 } = options || {};
+        // Playwright semantics: timeout 0 disables the timeout.
+        const deadline = timeout === 0 ? Infinity : Date.now() + timeout;
+        // Only forward the argument when the caller actually supplied one.
+        const evalArgs = arguments.length >= 2 ? [arg] : [];
         const startTime = Date.now();
+        let lastError = null;
         while (true) {
             try {
-                const result = await this.evaluate(pageFunction, arg);
+                const result = await this.evaluate(pageFunction, ...evalArgs);
                 if (result) return result;
+                lastError = null;
             } catch (e) {
-                // Ignore errors during polling
+                // Transient evaluation failures are expected while polling, but a dead
+                // connection cannot recover — fail fast instead of burning the timeout.
+                lastError = e;
+                const message = e instanceof Error ? e.message : String(e);
+                if (
+                    message.includes('RDP client is not connected') ||
+                    message.includes('RDP connection closed') ||
+                    message.includes('RDP request timed out')
+                ) {
+                    throw e;
+                }
             }
-            if (Date.now() - startTime > timeout) {
-                throw new Error('Timeout waiting for function');
+            if (Date.now() > deadline) {
+                const source = String(pageFunction).replace(/\s+/g, ' ').slice(0, 200);
+                const lastErrorSuffix = lastError ? ` (last error: ${lastError instanceof Error ? lastError.message : String(lastError)})` : '';
+                throw new Error(`Timed out after ${Date.now() - startTime}ms waiting for function: ${source}${lastErrorSuffix}`);
             }
             await new Promise((resolve) => setTimeout(resolve, polling));
         }
@@ -370,17 +537,23 @@ async function installHelperExtension(client, addonsActor, serverPort) {
     // Copy helper extension to a temp dir and write config.json with server port
     const tmpDir = await fs.mkdtemp(`${os.tmpdir()}/fx-harness-helper-`);
     _tempDirs.add(tmpDir);
-    const srcFiles = await fs.readdir(helperExtensionPath);
-    for (const file of srcFiles) {
-        await fs.copyFile(path.join(helperExtensionPath, file), path.join(tmpDir, file));
-    }
-    await fs.writeFile(path.join(tmpDir, 'config.json'), JSON.stringify({ port: serverPort }));
+    try {
+        await fs.cp(helperExtensionPath, tmpDir, { recursive: true });
+        await fs.writeFile(path.join(tmpDir, 'config.json'), JSON.stringify({ port: serverPort }));
 
-    await client.request({
-        to: addonsActor,
-        type: 'installTemporaryAddon',
-        addonPath: tmpDir,
-    });
+        await rdpRequest(
+            client,
+            {
+                to: addonsActor,
+                type: 'installTemporaryAddon',
+                addonPath: tmpDir,
+            },
+            { what: 'installTemporaryAddon (helper extension)' },
+        );
+    } catch (err) {
+        await removeTempDir(tmpDir);
+        throw err;
+    }
 
     return tmpDir;
 }
@@ -489,8 +662,16 @@ function buildFirefoxLaunchOptions(rdpPort, playwrightOptions = {}) {
  * temporary add-ons. The caller owns cleanup (client.disconnect()) once this resolves.
  */
 async function connectExtensionRdp(rdpPort) {
-    const client = await connectToFirefox(rdpPort);
+    const client = new FirefoxRDPClient();
+    // Socket errors tear the client down (rejecting in-flight requests and firing
+    // 'disconnect'); surface them for diagnosis rather than swallowing silently.
+    client.on('error', (err) => console.warn(`RDP client error: ${err?.message || err}`));
+    // Buffer evaluation results on the client itself (keyed by resultID) so
+    // waitForEvaluationResult can read them without the map being threaded through every
+    // layer; clear it when the connection drops.
     const evalResults = new Map();
+    client._evalResults = evalResults;
+    client.on('disconnect', () => evalResults.clear());
     const workerTargets = [];
     client.on('unsolicited-event', (msg) => {
         if (msg.type === 'evaluationResult') {
@@ -502,16 +683,18 @@ async function connectExtensionRdp(rdpPort) {
         }
         if (msg.type === 'target-available-form' && msg.target && msg.target.url) {
             workerTargets.push(msg.target);
+            client.emit('target-available', msg.target);
         }
     });
+    await withRdpDeadline(client, client.connect(rdpPort), RDP_REQUEST_TIMEOUT_MS, 'connect (root hello)');
 
     try {
-        const rootInfo = await client.request('getRoot');
+        const rootInfo = await rdpRequest(client, 'getRoot', { what: 'getRoot' });
         const addonsActor = rootInfo.addonsActor;
         if (!addonsActor) {
             throw new Error('Firefox does not provide an addons actor');
         }
-        return { client, evalResults, workerTargets, addonsActor };
+        return { client, workerTargets, addonsActor };
     } catch (err) {
         client.disconnect();
         throw err;
@@ -519,81 +702,160 @@ async function connectExtensionRdp(rdpPort) {
 }
 
 /**
+ * Build a predicate that recognises the extension's background page target, plus a
+ * human `description` for error messages.
+ *
+ * Firefox only synthesises the `_generated_background_page` URL for `background.scripts`;
+ * an extension declaring `background.page` announces its authored page URL instead. We
+ * read the manifest to cover both. The moz-extension:// UUID host is unknown ahead of
+ * time, so a declared page is matched by URL pathname suffix plus a console actor.
+ */
+async function buildBackgroundTargetMatcher(extensionPath) {
+    const generated = {
+        description: "the generated background page ('_generated_background_page')",
+        isBackground: (t) => Boolean(t && t.url && t.url.includes('_generated_background_page') && t.consoleActor),
+    };
+    let manifest;
+    try {
+        let raw = await fs.readFile(path.join(extensionPath, 'manifest.json'), 'utf8');
+        // Strip a leading BOM; Firefox tolerates it but JSON.parse does not.
+        if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+        manifest = JSON.parse(raw);
+    } catch {
+        // The install already validated the manifest; if we can't read/parse it here
+        // (e.g. it uses comments) fall back to the generated-page matcher.
+        return generated;
+    }
+    const page = manifest.background && typeof manifest.background.page === 'string' ? manifest.background.page : null;
+    if (!page) {
+        return generated;
+    }
+    const normalized = page.replace(/^\.?\//, '');
+    const pathnameOf = (url) => {
+        try {
+            return new URL(url).pathname;
+        } catch {
+            return url;
+        }
+    };
+    return {
+        description: `the manifest background.page ('${normalized}')`,
+        isBackground: (t) => Boolean(t && t.url && t.consoleActor) && pathnameOf(t.url).endsWith('/' + normalized),
+    };
+}
+
+/**
+ * Wait for the extension's background page target to be announced by the watcher
+ * (a 'target-available-form' event, re-emitted by connectExtensionRdp as
+ * 'target-available' and buffered in workerTargets). Attach BEFORE sending the
+ * watchTargets requests so the announcement can't be missed.
+ */
+function waitForBackgroundTarget(client, workerTargets, timeoutMs, { isBackground, description }) {
+    const buffered = workerTargets.find(isBackground);
+    if (buffered) return Promise.resolve(buffered);
+
+    return new Promise((resolve, reject) => {
+        if (!client._rdpConnection) {
+            reject(new Error('RDP connection closed while waiting for the background page target'));
+            return;
+        }
+        const cleanup = () => {
+            clearTimeout(timer);
+            client.off('target-available', onTarget);
+            client.off('disconnect', onDisconnect);
+        };
+        const onTarget = (target) => {
+            if (!isBackground(target)) return;
+            cleanup();
+            resolve(target);
+        };
+        const onDisconnect = (error) => {
+            cleanup();
+            reject(new Error(`RDP connection closed while waiting for the background page target: ${error?.message || error}`));
+        };
+        const timer = setTimeout(() => {
+            cleanup();
+            reject(new Error(`Timed out waiting for the extension's background page target (waited for ${description})`));
+        }, timeoutMs);
+        timer.unref?.();
+        client.on('target-available', onTarget);
+        client.once('disconnect', onDisconnect);
+    });
+}
+
+/**
  * Install the extension under test as a temporary add-on and find the console actor
  * for its background page, so that code can be evaluated in the background context.
  * @param {object} rdp - The result of connectExtensionRdp().
  * @param {string} extensionPath - Absolute path to the built, unpacked extension.
- * @param {string} addonId - The extension's add-on ID (from its manifest).
  */
-async function installExtensionAndFindBackground(rdp, extensionPath, addonId) {
+async function installExtensionAndFindBackground(rdp, extensionPath) {
     const { client, workerTargets, addonsActor } = rdp;
 
-    const installResult = await client.request({
-        to: addonsActor,
-        type: 'installTemporaryAddon',
-        addonPath: extensionPath,
-    });
+    // Firefox reports the installed add-on's id in the response, so the harness doesn't
+    // need it configured; this also works for extensions without an explicit gecko id.
+    const installResponse = await rdpRequest(
+        client,
+        {
+            to: addonsActor,
+            type: 'installTemporaryAddon',
+            addonPath: extensionPath,
+        },
+        { what: 'installTemporaryAddon (extension under test)' },
+    );
+    const addonId = installResponse?.addon?.id;
+    if (!addonId) {
+        throw new Error(`installTemporaryAddon did not return an add-on id (response: ${JSON.stringify(installResponse)})`);
+    }
 
+    // The installTemporaryAddon ack doesn't guarantee the addon is listed yet, so retry
+    // briefly until it appears (we need its actor for getWatcher).
     let ourAddon = null;
-    const maxAddonRetries = 10;
+    const maxAddonRetries = 40;
     for (let attempt = 0; attempt < maxAddonRetries; attempt++) {
-        const addonsResponse = await client.request('listAddons');
+        const addonsResponse = await rdpRequest(client, 'listAddons', { what: 'listAddons' });
         ourAddon = addonsResponse.addons.find((a) => a.id === addonId);
         if (ourAddon) break;
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (!ourAddon) {
         throw new Error(`Could not find addon ${addonId} after ${maxAddonRetries} attempts`);
     }
 
-    const watcherResult = await client.request({
-        to: ourAddon.actor,
-        type: 'getWatcher',
-    });
+    const watcherResult = await rdpRequest(client, { to: ourAddon.actor, type: 'getWatcher' }, { what: 'getWatcher' });
 
-    await client.request({
-        to: watcherResult.actor,
-        type: 'watchTargets',
-        targetType: 'frame',
-    });
+    // Attach the waiter before watchTargets so the target announcement can't race it.
+    const matcher = await buildBackgroundTargetMatcher(extensionPath);
+    const backgroundTargetPromise = waitForBackgroundTarget(client, workerTargets, 10000, matcher);
+    backgroundTargetPromise.catch(() => {}); // rejection is handled at the await below
 
-    const workerResult = await client.request({
-        to: watcherResult.actor,
-        type: 'watchTargets',
-        targetType: 'worker',
-    });
+    await rdpRequest(client, { to: watcherResult.actor, type: 'watchTargets', targetType: 'frame' }, { what: 'watchTargets (frame)' });
+    await rdpRequest(client, { to: watcherResult.actor, type: 'watchTargets', targetType: 'worker' }, { what: 'watchTargets (worker)' });
 
-    let backgroundConsoleActor = null;
-    if (workerResult.target && workerResult.target.url && workerResult.target.url.includes('_generated_background_page')) {
-        backgroundConsoleActor = workerResult.target.consoleActor;
+    let backgroundTarget;
+    try {
+        backgroundTarget = await backgroundTargetPromise;
+    } catch (err) {
+        throw new Error(`Could not find background console actor for ${addonId}: ${err instanceof Error ? err.message : String(err)}`);
     }
+    const backgroundConsoleActor = backgroundTarget.consoleActor;
 
-    if (!backgroundConsoleActor) {
-        const maxTargetRetries = 20;
-        for (let attempt = 0; attempt < maxTargetRetries; attempt++) {
-            const bgTarget = workerTargets.find((t) => t.url && t.url.includes('_generated_background_page'));
-            if (bgTarget && bgTarget.consoleActor) {
-                backgroundConsoleActor = bgTarget.consoleActor;
-                break;
-            }
-            await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-    }
+    await rdpRequest(
+        client,
+        {
+            to: backgroundConsoleActor,
+            type: 'startListeners',
+            listeners: ['evaluationResult'],
+        },
+        { what: 'startListeners' },
+    );
 
-    if (!backgroundConsoleActor) {
-        throw new Error(`Could not find background console actor for ${addonId}`);
-    }
-
-    await client.request({
-        to: backgroundConsoleActor,
-        type: 'startListeners',
-        listeners: ['evaluationResult'],
-    });
-
-    return { addon: installResult.addon, backgroundConsoleActor };
+    return { backgroundConsoleActor };
 }
 
 /**
+ * @param {number} rdpPort - Port for Firefox's remote debugging server.
+ * @param {string} extensionPath - Absolute path to the built, unpacked extension.
  * @param {object} [options]
  * @param {function} [options.routeHandler] - Playwright-style handler for the extension's
  *   redirected background requests.
@@ -602,7 +864,7 @@ async function installExtensionAndFindBackground(rdp, extensionPath, addonId) {
  * @param {object} [options.playwrightOptions] - Resolved standard Playwright `use` options
  *   (headless, launchOptions, viewport, ...) forwarded from the `context` fixture.
  */
-async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {}) {
+async function createFirefoxContext(rdpPort, extensionPath, options = {}) {
     const { routeHandler, rewriteStaticRules, playwrightOptions } = options;
     // 1. Start local web server
     const server = new FirefoxWebServer();
@@ -614,41 +876,33 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
         server.setRouteHandler(routeHandler);
     }
 
-    // 2. Launch Firefox
-    const userDataDir = await fs.mkdtemp(`${os.tmpdir()}/firefox-test-`);
-    _tempDirs.add(userDataDir);
-
-    // Patch playwright.cfg to enable experiment_apis
-    await ensureFirefoxPatched();
-
-    const context = await firefox.launchPersistentContext(
-        userDataDir,
-        buildFirefoxLaunchOptions(rdpPort, playwrightOptions),
-    );
-
-    // 3. Connect via RDP
-    let rdp;
-    try {
-        rdp = await connectExtensionRdp(rdpPort);
-    } catch (err) {
-        await server.stop();
-        await withTimeout(context.close(), 10000);
-        await rmTempDir(userDataDir).catch(() => {});
-        _tempDirs.delete(userDataDir);
-        throw err;
-    }
-    const { client, evalResults, addonsActor } = rdp;
-
+    let userDataDir;
+    let context;
+    let client;
     let helperTmpDir;
     try {
+        // 2. Launch Firefox (patched for experiment_apis support)
+        await ensureFirefoxPatched();
+        userDataDir = await fs.mkdtemp(`${os.tmpdir()}/firefox-test-`);
+        _tempDirs.add(userDataDir);
+        context = await firefox.launchPersistentContext(userDataDir, buildFirefoxLaunchOptions(rdpPort, playwrightOptions));
+
+        // 3. Connect via RDP
+        const rdp = await connectExtensionRdp(rdpPort);
+        client = rdp.client;
+        const { addonsActor } = rdp;
+
         // 4. Install helper extension FIRST (so XPCOM observers are active before the extension fetches config)
         helperTmpDir = await installHelperExtension(client, addonsActor, server.port);
 
         // 5. Wait for helper's ready event
-        await server.waitForEvent((e) => e.type === 'ready', 10000);
+        const ready = await server.waitForEvent((e) => e.type === 'ready', 10000);
+        if (ready.errors && ready.errors.length > 0) {
+            throw new Error(`Firefox harness helper extension failed to initialise: ${ready.errors.join('; ')}`);
+        }
 
         // 6 + 7. Install the extension under test and find its background console actor
-        const { addon, backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath, addonId);
+        const { backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath);
 
         // Store for cleanup. Cast context to allow stashing private fields.
         const ctx = /** @type {any} */ (context);
@@ -656,27 +910,13 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
         ctx._firefoxHelperTmpDir = helperTmpDir;
         ctx._rdpClient = client;
         ctx._firefoxBackgroundConsoleActor = backgroundConsoleActor;
-        ctx._firefoxEvalResults = evalResults;
         ctx._firefoxWebServer = server;
 
-        return {
-            context,
-            rdpResult: {
-                addon,
-                client,
-                backgroundConsoleActor,
-                evalResults,
-            },
-        };
+        return { context };
     } catch (err) {
-        client.disconnect();
-        await server.stop();
-        await withTimeout(context.close(), 10000);
-        if (helperTmpDir) {
-            await rmTempDir(helperTmpDir).catch(() => {});
-        }
-        await rmTempDir(userDataDir).catch(() => {});
-        _tempDirs.delete(userDataDir);
+        // Close Firefox before stopping the server (teardownFirefoxResources encodes the
+        // correct order); an unbounded stop here would mask `err` behind the test timeout.
+        await teardownFirefoxResources({ client, context, server, tempDirs: [helperTmpDir, userDataDir] });
         throw err;
     }
 }
@@ -685,54 +925,54 @@ async function createFirefoxContext(rdpPort, extensionPath, addonId, options = {
 // burn the whole 60s teardown budget on one stuck await.
 function withTimeout(promise, ms) {
     let timer;
-    const timeout = new Promise((resolve) => { timer = setTimeout(resolve, ms); });
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(resolve, ms);
+    });
     return Promise.race([promise.catch(() => null), timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
- * Clean up Firefox context resources
+ * Tear down harness resources in the one correct order, so every call site shares it:
+ * 1. disconnect the RDP client (synchronous; rejects in-flight work, and its 'disconnect'
+ *    listener clears the eval-result buffer)
+ * 2. close the browser context (bounded) — BEFORE stopping the server, because the browser
+ *    can hold in-flight proxied requests open and server.close() waits on active connections
+ * 3. stop the web server (bounded)
+ * 4. remove temp dirs
+ * Every field is optional so the standalone path (no server) and partial-failure paths can
+ * reuse it.
  */
-async function cleanupFirefoxContext(context) {
-    // Stop the web server first
-    if (context._firefoxWebServer) {
-        await withTimeout(context._firefoxWebServer.stop(), 5000);
-        context._firefoxWebServer = null;
-    }
-
-    // Disconnect RDP (web-ext client has disconnect() method)
-    if (context._rdpClient) {
+async function teardownFirefoxResources({ client = null, context = null, server = null, tempDirs = [] }) {
+    if (client) {
         try {
-            context._rdpClient.disconnect();
-        } catch (e) {
+            client.disconnect();
+        } catch {
             // Ignore disconnect errors
         }
-        context._rdpClient = null;
     }
-
-    // Clear the evalResults map to prevent any stale state
-    if (context._firefoxEvalResults) {
-        context._firefoxEvalResults.clear();
-        context._firefoxEvalResults = null;
+    if (context) {
+        await withTimeout(context.close(), 10000);
     }
-
-    // Close the browser context
-    await withTimeout(context.close(), 10000);
-
-    // Wait for browser to fully shut down
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // Clean up temp directories
-    for (const dir of [context._firefoxUserDataDir, context._firefoxHelperTmpDir]) {
-        if (dir) {
-            try {
-                await withTimeout(rmTempDir(dir), 5000);
-            } catch (e) {
-                const message = e instanceof Error ? e.message : String(e);
-                console.warn(`cleanupFirefoxContext: failed to remove ${dir}: ${message}`);
-            }
-            _tempDirs.delete(dir);
-        }
+    if (server) {
+        await withTimeout(server.stop(), 5000);
     }
+    for (const dir of tempDirs) {
+        if (dir) await removeTempDir(dir);
+    }
+}
+
+/**
+ * Clean up Firefox context resources.
+ */
+async function cleanupFirefoxContext(context) {
+    await teardownFirefoxResources({
+        client: context._rdpClient,
+        context,
+        server: context._firefoxWebServer,
+        tempDirs: [context._firefoxUserDataDir, context._firefoxHelperTmpDir],
+    });
+    context._rdpClient = null;
+    context._firefoxWebServer = null;
 }
 
 /**
@@ -751,7 +991,6 @@ async function cleanupFirefoxContext(context) {
  *
  * @param {object} options
  * @param {string} options.extensionPath - Absolute path to the built, unpacked extension.
- * @param {string} options.addonId - The extension's add-on ID (from its manifest).
  * @param {boolean} [options.headless] - Defaults to Playwright's default (headless).
  * @param {object} [options.firefoxUserPrefs] - Extra Firefox preferences, e.g.
  *   `{ 'extensions.dnr.feedback': true }`. The harness's required preferences are
@@ -759,52 +998,38 @@ async function cleanupFirefoxContext(context) {
  * @param {string[]} [options.args] - Extra Firefox command line arguments.
  * @returns {Promise<{ background: FirefoxBackgroundPage, close: () => Promise<void> }>}
  */
-async function launchExtensionBackground({ extensionPath, addonId, headless, firefoxUserPrefs, args }) {
-    const rdpPort = await findFreeTcpPort();
+async function launchExtensionBackground({ extensionPath, headless, firefoxUserPrefs, args }) {
+    const { port: rdpPort, release: releaseRdpPort } = await acquireRdpPort();
 
     const userDataDir = await fs.mkdtemp(`${os.tmpdir()}/firefox-ext-background-`);
     _tempDirs.add(userDataDir);
 
-    const context = await firefox.launchPersistentContext(
-        userDataDir,
-        buildFirefoxLaunchOptions(rdpPort, { headless, launchOptions: { firefoxUserPrefs, args } }),
-    );
-
+    let context = null;
     let client = null;
     try {
+        context = await firefox.launchPersistentContext(
+            userDataDir,
+            buildFirefoxLaunchOptions(rdpPort, { headless, launchOptions: { firefoxUserPrefs, args } }),
+        );
+
         const rdp = await connectExtensionRdp(rdpPort);
         client = rdp.client;
 
-        const { backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath, addonId);
-        const background = new FirefoxBackgroundPage(client, backgroundConsoleActor, rdp.evalResults);
+        const { backgroundConsoleActor } = await installExtensionAndFindBackground(rdp, extensionPath);
+        const background = new FirefoxBackgroundPage(client, backgroundConsoleActor);
 
         let closed = false;
         const close = async () => {
             if (closed) return;
             closed = true;
-            try {
-                client.disconnect();
-            } catch {
-                // Ignore disconnect errors
-            }
-            rdp.evalResults.clear();
-            await withTimeout(context.close(), 10000);
-            await rmTempDir(userDataDir).catch(() => {});
-            _tempDirs.delete(userDataDir);
+            await teardownFirefoxResources({ client, context, tempDirs: [userDataDir] });
+            await releaseRdpPort();
         };
 
         return { background, close };
     } catch (err) {
-        if (client) {
-            try {
-                client.disconnect();
-            } catch {
-                // Ignore disconnect errors
-            }
-        }
-        await withTimeout(context.close(), 10000);
-        await rmTempDir(userDataDir).catch(() => {});
-        _tempDirs.delete(userDataDir);
+        await teardownFirefoxResources({ client, context, tempDirs: [userDataDir] });
+        await releaseRdpPort();
         throw err;
     }
 }
@@ -815,4 +1040,7 @@ module.exports = {
     createFirefoxContext,
     cleanupFirefoxContext,
     launchExtensionBackground,
+    buildFirefoxLaunchOptions,
+    replaceExactlyOnce,
+    rdpRequest,
 };

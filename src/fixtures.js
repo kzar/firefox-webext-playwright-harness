@@ -9,7 +9,7 @@
  */
 
 const { createFirefoxContext, cleanupFirefoxContext, FirefoxBackgroundPage } = require('./harness.js');
-const { findFreeTcpPort } = require('./web-ext-rdp.js');
+const { acquireRdpPort } = require('./rdp-port.js');
 const { NetworkEventBridge } = require('./network-bridge.js');
 const { wrapWithNetworkBridge } = require('./proxies.js');
 const { installAddScriptTagPatch } = require('./script-tag.js');
@@ -20,7 +20,7 @@ const { installAddScriptTagPatch } = require('./script-tag.js');
  * @param {(route: any) => any} opts.defaultRouteHandler - Playwright route handler for the
  *   extension's pages and its redirected background requests.
  *
- * Per-extension data (addonId, extensionPath, rewriteStaticRules, postInstallPages) is read at
+ * Per-extension data (extensionPath, rewriteStaticRules, postInstallPages) is read at
  * runtime from the `firefoxHarnessConfig` Playwright option, which the consumer supplies via their
  * Firefox config's `use` block. `postInstallPages` is an optional array of URL substrings/RegExps
  * for tab(s) the extension opens on install; the page fixture waits for them to open before the
@@ -32,12 +32,18 @@ function applyFirefoxHarness(test, { defaultRouteHandler }) {
         // fixture runtime (not module load), which is why it's an option rather than an argument.
         firefoxHarnessConfig: [{}, { option: true }],
 
-        // RDP port for Firefox debugging. Each test gets a fresh port to ensure
-        // complete isolation.
+        // RDP port for Firefox debugging. Each test gets a fresh port, exclusively
+        // reserved for the test's lifetime so parallel workers can't be handed the same
+        // just-probed port and drive each other's Firefox (see rdp-port.js).
         rdpPort: [
             // eslint-disable-next-line no-empty-pattern
             async ({}, use) => {
-                await use(await findFreeTcpPort());
+                const { port, release } = await acquireRdpPort();
+                try {
+                    await use(port);
+                } finally {
+                    await release();
+                }
             },
             { scope: 'test' },
         ],
@@ -52,45 +58,63 @@ function applyFirefoxHarness(test, { defaultRouteHandler }) {
             { rdpPort, firefoxHarnessConfig, headless, launchOptions, viewport, userAgent, locale, timezoneId, colorScheme },
             use,
         ) {
-            const { addonId, extensionPath, rewriteStaticRules } = firefoxHarnessConfig;
+            const { extensionPath, rewriteStaticRules } = firefoxHarnessConfig;
 
-            const { context } = await createFirefoxContext(rdpPort, extensionPath, addonId, {
+            const { context } = await createFirefoxContext(rdpPort, extensionPath, {
                 routeHandler: defaultRouteHandler,
                 rewriteStaticRules,
                 playwrightOptions: { headless, launchOptions, viewport, userAgent, locale, timezoneId, colorScheme },
             });
 
-            await context.route('**/*', defaultRouteHandler);
+            let bridge;
+            let onRoute;
+            let onUnroute;
+            let onUnrouteAll;
+            try {
+                await context.route('**/*', defaultRouteHandler);
 
-            // Surface XPCOM network events as Playwright-style request events.
-            // The bridge is shared with the page fixture (one global stream).
-            const bridge = new NetworkEventBridge(context._firefoxWebServer);
-            context._firefoxBridge = bridge;
+                // Surface XPCOM network events as Playwright-style request events.
+                // The bridge is shared with the page fixture (one global stream).
+                bridge = new NetworkEventBridge(context._firefoxWebServer);
+                context._firefoxBridge = bridge;
 
-            // The background page is just an RDP wrapper over actors that exist as
-            // soon as the context does, so create it here (not only in the
-            // backgroundPage fixture). That lets config/TDS overrides always poke
-            // the extension to re-fetch, even for tests that never use the
-            // backgroundPage fixture directly.
-            context._firefoxBgPage = new FirefoxBackgroundPage(
-                context._rdpClient,
-                context._firefoxBackgroundConsoleActor,
-                context._firefoxEvalResults,
-            );
+                // The background page is just an RDP wrapper over actors that exist as
+                // soon as the context does, so create it here (not only in the
+                // backgroundPage fixture). That lets config/TDS overrides always poke
+                // the extension to re-fetch, even for tests that never use the
+                // backgroundPage fixture directly.
+                context._firefoxBgPage = new FirefoxBackgroundPage(
+                    context._rdpClient,
+                    context._firefoxBackgroundConsoleActor,
+                );
 
-            // context.route() additionally registers the route with the web server,
-            // so the extension's XPCOM-redirected background requests (config/TDS)
-            // are matched by the same handler.
-            const onRoute = (pattern, handler) => {
-                // Only string globs map to the extension's XPCOM-redirected requests
-                // on the web server. RegExp/function matchers are content-page
-                // matchers — the real context.route() (already called) handles those
-                // via Juggler; skip them here.
-                if (typeof pattern !== 'string') return;
-                context._firefoxWebServer.registerRoute(pattern, handler);
-            };
+                // context.route() additionally registers the route with the web server,
+                // so the extension's XPCOM-redirected background requests (config/TDS)
+                // are matched by the same handler.
+                onRoute = (pattern, handler) => {
+                    // Only string globs map to the extension's XPCOM-redirected requests
+                    // on the web server. RegExp/function matchers are content-page
+                    // matchers — the real context.route() (already called) handles those
+                    // via Juggler; skip them here.
+                    if (typeof pattern !== 'string') return;
+                    context._firefoxWebServer.registerRoute(pattern, handler);
+                };
+                onUnroute = (pattern, handler) => {
+                    if (typeof pattern !== 'string') return;
+                    context._firefoxWebServer.unregisterRoute(pattern, handler);
+                };
+                onUnrouteAll = () => {
+                    context._firefoxWebServer.clearRoutes();
+                };
+            } catch (err) {
+                // The context exists but fixture setup failed — clean up the browser
+                // and web server rather than leaking them for the rest of the run.
+                bridge?.dispose();
+                await cleanupFirefoxContext(context);
+                throw err;
+            }
 
-            await use(wrapWithNetworkBridge(context, bridge, { onRoute }));
+            await use(wrapWithNetworkBridge(context, bridge, { onRoute, onUnroute, onUnrouteAll }));
 
             bridge.dispose();
             // cleanupFirefoxContext closes the context internally.
@@ -120,6 +144,13 @@ function applyFirefoxHarness(test, { defaultRouteHandler }) {
                 while (!context.pages().some((pg) => isPostInstall(pg.url())) && Date.now() < deadline) {
                     await new Promise((resolve) => setTimeout(resolve, 50));
                 }
+                // Surface a stale/misconfigured pattern (the extension no longer opens the
+                // page) rather than silently costing every test the full 5s wait.
+                if (!context.pages().some((pg) => isPostInstall(pg.url()))) {
+                    console.warn(
+                        'firefox-webext-playwright-harness: no tab matching postInstallPages appeared within 5000ms — continuing without it',
+                    );
+                }
             }
             const page = await context.newPage();
             // Firefox's CSP blocks Playwright's addScriptTag; patch it (once) on
@@ -131,12 +162,10 @@ function applyFirefoxHarness(test, { defaultRouteHandler }) {
             await use(wrapWithNetworkBridge(page, context._firefoxBridge));
         },
 
-        // wraps the 'route' function in a manifest agnostic way
-        async routeExtensionRequests({ context }, use) {
-            await use(context.route.bind(context));
-        },
-
-        // Use this for listening and modifying network events.
+        // The wrapped context, for listening to and modifying background network
+        // events. Consumers with a base fixture of the same name get this Firefox
+        // implementation layered over it; the harness's own tests (built on raw
+        // @playwright/test) rely on it being defined here.
         async backgroundNetworkContext({ context }, use) {
             await use(context);
         },

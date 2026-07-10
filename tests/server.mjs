@@ -29,6 +29,44 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // /redirect lets the network spec observe redirect classification.
+    if (pathname === '/redirect') {
+        res.writeHead(302, { location: '/ok' });
+        res.end();
+        return;
+    }
+
+    // Same page but with a CSP that blocks inline <script> (script-src 'self' has no
+    // 'unsafe-inline'). Used by the currently-disabled CSP-bypass test in
+    // script-tag.spec.mjs (see the TODO there); kept so that test is ready to re-enable.
+    if (pathname === '/csp') {
+        res.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" });
+        res.end(PAGE_HTML);
+        return;
+    }
+
+    // Served for addScriptTag({ url }).
+    if (pathname === '/injected.js') {
+        res.writeHead(200, { 'content-type': 'text/javascript' });
+        res.end("window.__injectedFromUrl = 'url-ok';");
+        return;
+    }
+
+    // A page containing an iframe, so the frame-variant test can inject into a frame.
+    if (pathname === '/frame') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(
+            '<!doctype html><html><head><meta charset="utf-8"><title>Frame host</title></head>' +
+                '<body><iframe src="/frame-child"></iframe></body></html>',
+        );
+        return;
+    }
+    if (pathname === '/frame-child') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<!doctype html><html><head><meta charset="utf-8"><title>Frame child</title></head><body><p>child</p></body></html>');
+        return;
+    }
+
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found');
 });

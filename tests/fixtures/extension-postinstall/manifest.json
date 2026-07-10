@@ -1,0 +1,14 @@
+{
+    "manifest_version": 2,
+    "name": "Harness Test Extension (post-install)",
+    "version": "1.0.0",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "harness-test-postinstall@example.com"
+        }
+    },
+    "permissions": ["tabs"],
+    "background": {
+        "scripts": ["background.js"]
+    }
+}

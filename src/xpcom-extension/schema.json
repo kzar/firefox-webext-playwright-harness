@@ -54,6 +54,10 @@
                             },
                             "requestStatus": {
                                 "type": "integer"
+                            },
+                            "proxied": {
+                                "type": "boolean",
+                                "description": "True on a request event that was redirected to the harness server."
                             }
                         }
                     }

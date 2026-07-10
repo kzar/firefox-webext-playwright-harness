@@ -60,8 +60,8 @@ test.describe('Background script eval', () => {
     });
 
     test('returns a large result from a resolved promise', async ({ backgroundPage }) => {
-        // The promise path stashes the serialised value on a globalThis slot and reads
-        // it back, so a large value exercises the longString handling on that read too.
+        // The settled value is delivered in the single awaited evaluationResult, so a
+        // large value exercises the longString handling on the awaited path too.
         const size = 50000;
         const big = await backgroundPage.evaluate((n) => Promise.resolve('z'.repeat(n)), size);
         expect(big).toHaveLength(size);
@@ -74,8 +74,8 @@ test.describe('Background script eval', () => {
     });
 
     test('resolves a promise that settles after a delay', async ({ backgroundPage }) => {
-        // The value isn't ready on the first read of the result slot, so this exercises
-        // the re-read loop rather than the immediate path.
+        // The console actor holds the evaluationResult until the promise settles
+        // (mapped: { await: true }), so this exercises the server-side await.
         const value = await backgroundPage.evaluate(
             (ms) => new Promise((resolve) => setTimeout(() => resolve('delayed'), ms)),
             200,
@@ -93,6 +93,40 @@ test.describe('Background script eval', () => {
 
     test('propagates a rejected promise', async ({ backgroundPage }) => {
         await expect(backgroundPage.evaluate(() => Promise.reject(new Error('async boom')))).rejects.toThrow('async boom');
+    });
+
+    test('propagates a thrown string', async ({ backgroundPage }) => {
+        await expect(
+            backgroundPage.evaluate(() => {
+                // eslint-disable-next-line no-throw-literal
+                throw 'string boom';
+            }),
+        ).rejects.toThrow('string boom');
+    });
+
+    test('propagates a thrown plain object', async ({ backgroundPage }) => {
+        await expect(backgroundPage.evaluate(() => Promise.reject({ code: 42 }))).rejects.toThrow('{"code":42}');
+    });
+
+    test('preserves the remote error name', async ({ backgroundPage }) => {
+        const error = await backgroundPage
+            .evaluate(() => {
+                throw new TypeError('type boom');
+            })
+            .catch((e) => e);
+        expect(error.name).toBe('TypeError');
+        expect(error.message).toContain('type boom');
+    });
+
+    test('rejects with a clear error for an unserialisable argument', async ({ backgroundPage }) => {
+        await expect(backgroundPage.evaluate((cb) => cb(), () => 1)).rejects.toThrow(
+            'Unsupported evaluate() argument at index 0: function is not serializable',
+        );
+    });
+
+    test('supports undefined arguments, including before later arguments', async ({ backgroundPage }) => {
+        expect(await backgroundPage.evaluate((a) => typeof a, undefined)).toBe('undefined');
+        expect(await backgroundPage.evaluate((a, b) => [typeof a, b], undefined, 5)).toEqual(['undefined', 5]);
     });
 
     test('round-trips falsy return values', async ({ backgroundPage }) => {
@@ -113,5 +147,17 @@ test.describe('Background script eval', () => {
         });
         const result = await backgroundPage.waitForFunction(() => globalThis.__ready === true);
         expect(result).toBe(true);
+    });
+
+    test('waitForFunction reports the last predicate error on timeout', async ({ backgroundPage }) => {
+        await expect(
+            backgroundPage.waitForFunction(
+                () => {
+                    throw new Error('predicate boom');
+                },
+                undefined,
+                { timeout: 500, polling: 50 },
+            ),
+        ).rejects.toThrow(/Timed out after \d+ms waiting for function.*predicate boom/s);
     });
 });

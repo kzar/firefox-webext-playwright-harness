@@ -23,7 +23,9 @@
     ],
     "scripts": {
         "lint": "eslint .",
-        "playwright": "playwright test --config tests/playwright.config.mjs"
+        "playwright": "playwright test --config tests/playwright.config.mjs",
+        "test:unit": "node --test tests/unit/*.test.mjs",
+        "test:standalone": "node --test tests/standalone/*.test.mjs"
     },
     "dependencies": {
         "jszip": "^3.10.1"

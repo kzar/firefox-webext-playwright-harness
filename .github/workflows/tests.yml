@@ -16,8 +16,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Run unit tests
+        run: npm run test:unit
       - name: Install Playwright Firefox
         run: npx playwright install --with-deps firefox
+      # Before `npm run playwright`, whose globalSetup patches the bundled Firefox —
+      # the standalone entry point must work against the stock browser.
+      - name: Run standalone tests
+        run: npm run test:standalone
       - name: Run integration tests
         run: npm run playwright
       - uses: actions/upload-artifact@v7

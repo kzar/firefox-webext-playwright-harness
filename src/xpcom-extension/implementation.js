@@ -16,7 +16,7 @@
 this.networkObserver = class extends ExtensionAPI {
     getAPI(context) {
         // When set (e.g. "http://127.0.0.1:PORT"), every extension-initiated
-        // http(s) request is redirected to `${proxyOrigin}/proxy/<host>/<path>`,
+        // http(s) request is redirected to `${proxyOrigin}/proxy/<scheme>/<host>/<path>`,
         // where the harness web server runs the consumer's route handlers (and
         // falls back to the real origin). Playwright/Juggler can't intercept the
         // extension's background requests, so we redirect them here instead.
@@ -100,6 +100,14 @@ this.networkObserver = class extends ExtensionAPI {
             }
         }
 
+        // Should this request/response/stop event be suppressed because it belongs to
+        // the harness's own traffic — the helper's /events POSTs or the redirected
+        // /proxy/ channel itself? Those all target proxyOrigin; reporting them as
+        // extension activity would loop and confuse the bridge.
+        function isHarnessTraffic(details) {
+            return proxyOrigin && details && typeof details.url === 'string' && details.url.startsWith(proxyOrigin);
+        }
+
         // XPCOM observers - always active for redirect support
         const requestObserver = {
             observe(subject) {
@@ -107,32 +115,31 @@ this.networkObserver = class extends ExtensionAPI {
                     const channel = subject.QueryInterface(Ci.nsIHttpChannel);
                     const details = extractChannelDetails(channel, 'request');
 
-                    // Redirect extension-initiated requests to the harness server.
-                    let redirected = false;
+                    // Redirect extension-initiated requests to the harness server,
+                    // encoding both the original channel id and scheme as leading path
+                    // segments (/proxy/<channelId>/<scheme>/<host>/<path>). The channel id
+                    // lets the harness server key its terminal 'proxy-complete' event by
+                    // channel and report the true outcome; carrying it in the URL (which
+                    // redirectTo honours exactly) is collision-free and, unlike a request
+                    // header, survives the internal redirect reliably. The scheme is kept
+                    // so the server can reconstruct the original URL — http must not come
+                    // back as https.
                     if (proxyOrigin && details && shouldProxy(details)) {
-                        const newUrl = proxyOrigin + '/proxy/' + details.url.replace(/^https?:\/\//, '');
+                        const newUrl =
+                            proxyOrigin + '/proxy/' + details.channelId + '/' + details.url.replace(/^(https?):\/\//, '$1/');
                         channel.redirectTo(Services.io.newURI(newUrl));
-                        redirected = true;
+                        details.proxied = true;
+                    }
+
+                    // Suppress the harness's own /events and /proxy/ channels, but still
+                    // report the proxied request itself (its url is the original origin,
+                    // not proxyOrigin, so it isn't filtered here).
+                    if (isHarnessTraffic(details)) {
+                        return;
                     }
 
                     if (details) {
                         fireEvent(details);
-                    }
-
-                    // For redirected channels, fire a synthetic response event.
-                    // After redirectTo(), the redirect target's response/stop
-                    // events use the new URL which gets filtered by SERVER_URL
-                    // in background.js, leaving the original pending entry
-                    // unresolved. This synthetic event lets event consumers
-                    // (like logPageRequestsFirefox) resolve the entry.
-                    if (redirected && details) {
-                        fireEvent({
-                            type: 'response',
-                            url: details.url,
-                            channelId: details.channelId,
-                            method: details.method,
-                            redirectUrl: 'internal-redirect',
-                        });
                     }
                 } catch (e) {
                     // Ignore channels that can't be cast to nsIHttpChannel
@@ -143,6 +150,7 @@ this.networkObserver = class extends ExtensionAPI {
         const responseObserver = {
             observe(subject) {
                 const details = extractChannelDetails(subject, 'response');
+                if (isHarnessTraffic(details)) return;
                 if (details) {
                     fireEvent(details);
                 }
@@ -152,6 +160,7 @@ this.networkObserver = class extends ExtensionAPI {
         const cachedResponseObserver = {
             observe(subject) {
                 const details = extractChannelDetails(subject, 'cached-response');
+                if (isHarnessTraffic(details)) return;
                 if (details) {
                     fireEvent(details);
                 }
@@ -166,6 +175,12 @@ this.networkObserver = class extends ExtensionAPI {
                     const details = extractChannelDetails(channel, 'stop');
                     if (details) {
                         details.requestStatus = request.status;
+                        // Suppress the harness server's own *successful* stops, but let a
+                        // FAILING stop of a server-bound channel through so a dead harness
+                        // server can still surface as a failure downstream.
+                        if (isHarnessTraffic(details) && request.status === 0) {
+                            return;
+                        }
                         fireEvent(details);
                     }
                 } catch (e) {}
