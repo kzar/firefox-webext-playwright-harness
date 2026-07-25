@@ -83,6 +83,29 @@ function replaceExactlyOnce(content, needle, replacement, fileLabel) {
     return content.slice(0, first) + replacement + content.slice(first + needle.length);
 }
 
+// TODO - Switch to WebDriver BiDi and drop the Firefox patching.
+//
+// Notes:
+// - Available with Playwright `channel: 'moz-firefox-nightly'` (needs Playwright
+//   >= 1.62; `launchPersistentContext` hangs over BiDi on 1.60). Since
+//   `extensions.experiments.enabled` is honoured on Nightly and Developer
+//   Edition, the helper extension can use `experiment_apis` without the omni.ja
+//   patch. In turn that means we could remove `globalSetup` and the JSZip
+//   dependency too.
+// - The `-remote-allow-system-access` switch is required for any interaction
+//   with `moz-extension://` pages.
+//
+// Current blockers/issues as of July 2026 (Playwright 1.62, Firefox 155.0a1):
+// - Bug 1755014: Extension contexts aren't exposed to BiDi, needed for
+//                `backgroundPage.evaluate()`.
+// - Bug 2049350: Extension initiated requests are deliberately excluded from
+//                the `network.*` module.
+// - Bugs 1966217, 2007067, 1903272: Limited support for `moz-extension://`
+//                pages, even with the `-remote-allow-system-access` switch.
+//                Input events and locateNodes are unavailable, and load events
+//                are filtered out deliberately, so `goto()` needs
+//                `waitUntil: 'commit'`.
+
 let _firefoxPatched = false;
 /**
  * Patch Playwright's Firefox installation in-place to enable experiment_apis
